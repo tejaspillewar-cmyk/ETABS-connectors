@@ -119,7 +119,7 @@ try:
         print(f"\n  Classifying {n} frames...")
         for fname in frame_names:
             try:
-                ret_orient = SapModel.FrameObj.GetDesignOrientation(fname)
+                ret_orient = SapModel.FrameObj.GetDesignOrientation(fname, 0)
                 orient = ret_orient[0] if isinstance(ret_orient, (list, tuple)) else ret_orient
                 if orient == 1:
                     frame_counts['Column'] += 1
@@ -153,7 +153,7 @@ try:
         print(f"\n  Classifying {n} area elements...")
         for aname in area_names_cell2:
             try:
-                ret_orient = SapModel.AreaObj.GetDesignOrientation(aname)
+                ret_orient = SapModel.AreaObj.GetDesignOrientation(aname, 0)
                 orient = ret_orient[0] if isinstance(ret_orient, (list, tuple)) else ret_orient
                 if orient == 1:
                     area_counts['Wall'] += 1
@@ -217,8 +217,11 @@ except Exception as e:
     print(f"  [FAIL] PierLabel.GetNameList error: {e}")
 
 # --- Step 3b: Get section properties for each pier ---
+story_pier_data = {}
+
 if pier_names:
     print(f"\n  --- Pier Section Properties ---")
+    
     for p_name in pier_names:
         try:
             ret_sec = SapModel.PierLabel.GetSectionProperties(
@@ -267,7 +270,17 @@ if pier_names:
                     x2 = cg_x + (float(width_bot[i]) / 2.0) * math.cos(ang_rad)
                     y2 = cg_y + (float(width_bot[i]) / 2.0) * math.sin(ang_rad)
                     
-                    print(f"    Story: {str(story_arr[i]):20s}  Width(d)={w_mm:.0f} mm  Thick(b)={t_mm:.0f} mm")
+                    story_name = str(story_arr[i])
+                    story_pier_data.setdefault(story_name, []).append({
+                        "label": p_name,
+                        "cg_x": cg_x,
+                        "cg_y": cg_y,
+                        "length_m": float(width_bot[i]),
+                        "thick_m": float(thick_bot[i]),
+                        "angle_rad": ang_rad
+                    })
+                    
+                    print(f"    Story: {story_name:20s}  Width(d)={w_mm:.0f} mm  Thick(b)={t_mm:.0f} mm")
                     print(f"           Start Node: X={x1:.3f}, Y={y1:.3f} | End Node: X={x2:.3f}, Y={y2:.3f}")
         except Exception as e:
             print(f"  [FAIL] Pier '{p_name}': {e}")
@@ -282,7 +295,7 @@ try:
     if ok:
         for aname in all_area_names:
             try:
-                ret_pl = SapModel.AreaObj.GetPier(aname)
+                ret_pl = SapModel.AreaObj.GetPier(aname, "")
                 pier_label = None
                 if isinstance(ret_pl, (list, tuple)):
                     for item in ret_pl:
@@ -309,9 +322,130 @@ except Exception as e:
 
 
 
+# --- Step 4: Export to DXF via ezdxf ---
+print(f"\n  --- Interactive DXF Generation ---")
+
+# --- Console-based Story Selection (replaces the Listbox popup) ---
+if not story_pier_data:
+    print("    [WARN] No pier data collected. Skipping DXF export.")
+else:
+    available_stories = list(story_pier_data.keys())
+    print("\n  Available stories:")
+    for i, s in enumerate(available_stories, 1):
+        print(f"    {i}. {s}")
+
+    sel = input("\n  Enter story numbers to export (comma-separated, or 'all'): ").strip()
+
+    if sel.lower() == "all":
+        selected_stories = available_stories
+    else:
+        try:
+            idxs = [int(x.strip()) - 1 for x in sel.split(",") if x.strip()]
+            selected_stories = [available_stories[i] for i in idxs if 0 <= i < len(available_stories)]
+        except ValueError:
+            selected_stories = []
+
+    if not selected_stories:
+        print("  [INFO] No valid stories selected. Export aborted.")
+    else:
+        import tkinter as tk
+        from tkinter import filedialog
+        import os
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+
+        default_dir = ""
+        try:
+            model_path = SapModel.GetModelFilepath()
+            if model_path:
+                default_dir = os.path.dirname(model_path)
+        except:
+            pass
+
+        dxf_filename = filedialog.asksaveasfilename(
+            parent=root, title="Save Pier Layout DXF", initialdir=default_dir,
+            initialfile="pier_layout.dxf", defaultextension=".dxf",
+            filetypes=[("DXF Files", "*.dxf"), ("All Files", "*.*")]
+        )
+        root.destroy()
+
+        if not dxf_filename:
+            print("  [INFO] DXF save cancelled.")
+        else:
+            try:
+                print("  [DEBUG] Importing ezdxf and creating new document...")
+                import ezdxf
+                import math
+                
+                doc = ezdxf.new("R2010")
+                msp = doc.modelspace()
+                
+                print("  [DEBUG] Processing stories and generating DXF entities...")
+                
+                for story_name in selected_stories:
+                    piers = story_pier_data[story_name]
+                    layer_name = f"Story_{story_name}".replace(" ", "_").replace("-", "_")
+                    doc.layers.add(layer_name)
+                    
+                    for pier in piers:
+                        cg_x = pier["cg_x"]
+                        cg_y = pier["cg_y"]
+                        L = pier["length_m"]
+                        T = pier["thick_m"]
+                        angle_rad = pier["angle_rad"]
+                        label = pier["label"]
+                        
+                        # Calculate 4 corners of the rectangle
+                        # Local X is along length, Local Y is along thickness
+                        dx_L = (L / 2.0) * math.cos(angle_rad)
+                        dy_L = (L / 2.0) * math.sin(angle_rad)
+                        
+                        dx_T = (T / 2.0) * math.cos(angle_rad + math.pi/2)
+                        dy_T = (T / 2.0) * math.sin(angle_rad + math.pi/2)
+                        
+                        p1 = (cg_x - dx_L - dx_T, cg_y - dy_L - dy_T)
+                        p2 = (cg_x + dx_L - dx_T, cg_y + dy_L - dy_T)
+                        p3 = (cg_x + dx_L + dx_T, cg_y + dy_L + dy_T)
+                        p4 = (cg_x - dx_L + dx_T, cg_y - dy_L + dy_T)
+                        
+                        # Draw closed polyline
+                        msp.add_lwpolyline([p1, p2, p3, p4], format="xy", close=True, dxfattribs={"layer": layer_name})
+                        
+                        # Intelligent Text Placement
+                        # Determine if vertical or horizontal (using degrees for simplicity)
+                        deg = math.degrees(angle_rad) % 180
+                        is_vertical = (45 < deg < 135)
+                        
+                        text_height = 0.5
+                        offset = 0.5 # gap between pier edge and text
+                        
+                        from ezdxf.enums import TextEntityAlignment
+                        if is_vertical:
+                            # Place text to the right
+                            txt_x = cg_x + (T / 2.0) + offset
+                            txt_y = cg_y
+                            align = TextEntityAlignment.MIDDLE_LEFT
+                        else:
+                            # Place text above
+                            txt_x = cg_x
+                            txt_y = cg_y + (T / 2.0) + offset
+                            align = TextEntityAlignment.BOTTOM_CENTER
+                            
+                        text_ent = msp.add_text(label, dxfattribs={"layer": layer_name, "height": text_height})
+                        text_ent.set_placement((txt_x, txt_y), align=align)
+                        
+                doc.saveas(dxf_filename)
+                print(f"  [OK] Successfully saved DXF to: {dxf_filename}")
+                
+            except Exception as e:
+                import traceback
+                print(f"  [FAIL] Failed to generate DXF: {e}")
+                traceback.print_exc()
+
 print("\n" + "=" * 60)
 print("  CELL 3 COMPLETE")
 print("=" * 60)
-
 
 # %%
