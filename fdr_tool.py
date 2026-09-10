@@ -79,6 +79,22 @@ class FDRConfig:
 # Pure helper functions (no state, no side-effects)
 # =================================================================
 
+def parse_namelist(ret):
+    """Parse GetNameList return tuple. Returns (success:bool, count:int, names:list)."""
+    if ret is None or len(ret) < 2:
+        return False, 0, []
+    if len(ret) >= 3 and ret[0] == 0 and isinstance(ret[1], int):
+        names = list(ret[2]) if ret[2] else []
+        return True, ret[1], names
+    if isinstance(ret[0], int) and ret[0] > 0:
+        names = list(ret[1]) if ret[1] else []
+        return True, ret[0], names
+    if len(ret) >= 3 and isinstance(ret[0], int) and ret[0] != 0:
+        return False, 0, []
+    if ret[0] == 0:
+        return True, 0, []
+    return False, 0, []
+
 def is_wind_combo(combo: str, wind_keywords: list[str]) -> bool:
     """Check if a load combination name contains any wind keyword."""
     if not combo:
@@ -194,13 +210,14 @@ class FDRTool:
     def get_available_combos(self) -> list[str]:
         """Return the list of response combination names defined in the model."""
         ret = self.SapModel.RespCombo.GetNameList(0, [])
-        if ret[0] != 0:
+        ok, n, names = parse_namelist(ret)
+        if not ok:
             raise RuntimeError(
-                f"RespCombo.GetNameList failed (ret={ret[0]}). "
+                f"RespCombo.GetNameList failed (raw={ret}). "
                 "Check Define > Load Combinations in ETABS - this model may have "
                 "zero response combinations defined."
             )
-        return list(ret[2])
+        return list(names)
 
     def extract_pier_forces(self, selected_combos: list[str] | None = None) -> pd.DataFrame:
         """Extract pier force results from ETABS and compute Pmin/Pmax envelopes.
@@ -247,27 +264,41 @@ class FDRTool:
             0, [], [], [], [],
             [], [], [], [], [], []
         )
-        if ret[0] != 0:
-            raise RuntimeError(f"Results.PierForce failed (ret={ret[0]})")
-        num_results   = ret[1]
-        story_names   = ret[2]
-        pier_names    = ret[3]
-        load_cases    = ret[4]
-        locations     = ret[5]
-        p_values      = ret[6]
-        v2_values     = ret[7]
-        v3_values     = ret[8]
-        t_values      = ret[9]
-        m2_values     = ret[10]
-        m3_values     = ret[11]
+        if ret is None or len(ret) < 11:
+            raise RuntimeError(f"Results.PierForce failed (raw={ret})")
+            
+        if ret[0] == 0 and isinstance(ret[1], int):
+            num_results   = ret[1]
+            story_names   = ret[2]
+            pier_names    = ret[3]
+            load_cases    = ret[4]
+            locations     = ret[5]
+            p_values      = ret[6]
+            v2_values     = ret[7]
+            v3_values     = ret[8]
+            t_values      = ret[9]
+            m2_values     = ret[10]
+            m3_values     = ret[11]
+        else:
+            num_results   = ret[0]
+            story_names   = ret[1]
+            pier_names    = ret[2]
+            load_cases    = ret[3]
+            locations     = ret[4]
+            p_values      = ret[5]
+            v2_values     = ret[6]
+            v3_values     = ret[7]
+            t_values      = ret[8]
+            m2_values     = ret[9]
+            m3_values     = ret[10]
 
         print(f"  Extracted {num_results} pier force rows.")
 
         # --- Get Pier Section Properties ---
         ret_piers = SM.PierLabel.GetNameList(0, [])
-        if ret_piers[0] != 0:
-            raise RuntimeError(f"PierLabel.GetNameList failed (ret={ret_piers[0]})")
-        pier_label_list = ret_piers[2]
+        ok, n, pier_label_list = parse_namelist(ret_piers)
+        if not ok:
+            raise RuntimeError(f"PierLabel.GetNameList failed (raw={ret_piers})")
 
         pier_props = {}   # keyed by (pier_name, story_name) now, not just pier_name
         for p_name in pier_label_list:
@@ -275,16 +306,22 @@ class FDRTool:
                 ret_sec = SM.PierLabel.GetSectionProperties(
                     p_name, 0, [], [], [], [], [], [], [], [], [], [], [], [], [], [], []
                 )
-                if ret_sec and ret_sec[0] == 0:
-                    num_stories_for_pier = ret_sec[1]
-                    story_name_arr = ret_sec[2]
-                    width_bot_arr = ret_sec[6]
-                    thick_bot_arr = ret_sec[7]
+                if ret_sec is not None and len(ret_sec) >= 7:
+                    if ret_sec[0] == 0 and isinstance(ret_sec[1], int):
+                        num_stories_for_pier = ret_sec[1]
+                        story_name_arr = ret_sec[2]
+                        width_bot_arr = ret_sec[6]
+                        thick_bot_arr = ret_sec[7]
+                    else:
+                        num_stories_for_pier = ret_sec[0]
+                        story_name_arr = ret_sec[1]
+                        width_bot_arr = ret_sec[5]
+                        thick_bot_arr = ret_sec[6]
                     for s_idx in range(num_stories_for_pier):
                         story_nm = str(story_name_arr[s_idx]).strip()
                         pier_props[(p_name, story_nm)] = {
-                            'b': float(thick_bot_arr[s_idx]) * 1000,
-                            'd': float(width_bot_arr[s_idx]) * 1000,
+                            'b': float(thick_bot_arr[s_idx]),
+                            'd': float(width_bot_arr[s_idx]),
                             'fck': cfg.fck,
                         }
             except Exception as e:
@@ -375,17 +412,27 @@ class FDRTool:
 
         # --- Build a reverse lookup: pier name -> list of area object names ---
         ret_areas = SM.AreaObj.GetNameList(0, [])
-        if ret_areas[0] != 0:
-            raise RuntimeError(f"AreaObj.GetNameList failed (ret={ret_areas[0]})")
-        all_area_names = ret_areas[2]
+        ok, n, all_area_names = parse_namelist(ret_areas)
+        if not ok:
+            raise RuntimeError(f"AreaObj.GetNameList failed (raw={ret_areas})")
 
         pier_to_areas: dict[str, list[str]] = {}
         for area_name in all_area_names:
             try:
                 ret_pl = SM.AreaObj.GetPier(area_name, "")   # confirm exact signature before trusting - see note below
-                if ret_pl[0] == 0:
-                    pier_label = ret_pl[1]
-                    if pier_label:
+                pier_label = None
+                if isinstance(ret_pl, (list, tuple)):
+                    if len(ret_pl) >= 2 and ret_pl[0] == 0:
+                        pier_label = ret_pl[1]
+                    else:
+                        for item in ret_pl:
+                            if isinstance(item, str) and item.strip():
+                                pier_label = item.strip()
+                                break
+                elif isinstance(ret_pl, str):
+                    pier_label = ret_pl
+                    
+                if pier_label:
                         pier_to_areas.setdefault(pier_label, []).append(area_name)
             except Exception:
                 pass
@@ -396,14 +443,18 @@ class FDRTool:
                 area_names = pier_to_areas.get(pier_id, [])
                 if len(area_names) > 0:
                     ret_pts = SM.AreaObj.GetPoints(area_names[0], 0, [])
-                    if ret_pts and ret_pts[0] == 0:
-                        point_names = ret_pts[2]
+                    ok, n_pts, point_names = parse_namelist(ret_pts)
+                    if ok:
                         xs, ys = [], []
                         for pt_name in point_names:
                             ret_coord = SM.PointObj.GetCoordCartesian(pt_name, 0.0, 0.0, 0.0)
-                            if ret_coord[0] == 0:
-                                xs.append(float(ret_coord[1]) * 1000)
-                                ys.append(float(ret_coord[2]) * 1000)
+                            if isinstance(ret_coord, (list, tuple)) and len(ret_coord) >= 3:
+                                if ret_coord[0] == 0:
+                                    xs.append(float(ret_coord[1]))
+                                    ys.append(float(ret_coord[2]))
+                                else:
+                                    xs.append(float(ret_coord[0]))
+                                    ys.append(float(ret_coord[1]))
                         if len(xs) >= 2:
                             x_min, x_max = min(xs), max(xs)
                             y_min, y_max = min(ys), max(ys)

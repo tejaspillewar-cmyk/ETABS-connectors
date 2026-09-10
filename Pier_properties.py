@@ -255,8 +255,8 @@ if pier_names:
 
                 print(f"\n  Pier '{p_name}' -- {num_stories} story section(s):")
                 for i in range(num_stories):
-                    w_mm = float(width_bot[i]) * 1000
-                    t_mm = float(thick_bot[i]) * 1000
+                    w_mm = float(width_bot[i])
+                    t_mm = float(thick_bot[i])
                     
                     cg_x = float(cg_bot_x[i])
                     cg_y = float(cg_bot_y[i])
@@ -427,10 +427,10 @@ else:
                     pier_boxes = []
                     pier_corners_list = []
                     for pier in piers:
-                        cg_x = pier["cg_x"] * 1000.0
-                        cg_y = pier["cg_y"] * 1000.0
-                        L = pier["length_m"] * 1000.0
-                        T = pier["thick_m"] * 1000.0
+                        cg_x = pier["cg_x"]
+                        cg_y = pier["cg_y"]
+                        L = pier["length_m"]
+                        T = pier["thick_m"]
                         angle_rad = pier["angle_rad"]
                         
                         dx_L = (L / 2.0) * math.cos(angle_rad)
@@ -454,10 +454,10 @@ else:
                     
                     # 2. Sequential Collision Avoidance for Labels
                     for i, pier in enumerate(piers):
-                        cg_x = pier["cg_x"] * 1000.0
-                        cg_y = pier["cg_y"] * 1000.0
-                        L = pier["length_m"] * 1000.0
-                        T = pier["thick_m"] * 1000.0
+                        cg_x = pier["cg_x"]
+                        cg_y = pier["cg_y"]
+                        L = pier["length_m"]
+                        T = pier["thick_m"]
                         angle_rad = pier["angle_rad"]
                         label = pier["label"]
                         
