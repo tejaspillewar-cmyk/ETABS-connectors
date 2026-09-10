@@ -378,30 +378,63 @@ else:
                 print("  [DEBUG] Importing ezdxf and creating new document...")
                 import ezdxf
                 import math
+                from ezdxf.enums import TextEntityAlignment
                 
                 doc = ezdxf.new("R2010")
                 msp = doc.modelspace()
                 
-                print("  [DEBUG] Processing stories and generating DXF entities...")
+                print("  [DEBUG] Processing stories and generating DXF entities with collision avoidance...")
                 
+                # --- Helper Functions for Collision Avoidance ---
+                def compute_aabb(corners):
+                    xs = [p[0] for p in corners]
+                    ys = [p[1] for p in corners]
+                    return [min(xs), min(ys), max(xs), max(ys)]
+
+                def boxes_overlap(b1, b2, margin=100.0):
+                    # b1, b2 are [min_x, min_y, max_x, max_y]
+                    return not (b1[2] + margin < b2[0] or b1[0] - margin > b2[2] or 
+                                b1[3] + margin < b2[1] or b1[1] - margin > b2[3])
+
+                def make_label_box(x, y, text, align="MIDDLE_LEFT", char_w=350.0, text_h=500.0):
+                    w = len(text) * char_w
+                    h = text_h
+                    if align == "MIDDLE_LEFT":
+                        return [x, y - h/2, x + w, y + h/2]
+                    elif align == "MIDDLE_RIGHT":
+                        return [x - w, y - h/2, x, y + h/2]
+                    elif align == "BOTTOM_CENTER":
+                        return [x - w/2, y, x + w/2, y + h]
+                    elif align == "TOP_CENTER":
+                        return [x - w/2, y - h, x + w/2, y]
+                    return [x, y, x+w, y+h]
+                
+                # Auto-generate .scr path alongside the .dxf file
+                scr_filename = dxf_filename.rsplit('.', 1)[0] + ".scr"
+                scr_lines = []
+
                 for story_name in selected_stories:
                     piers = story_pier_data[story_name]
                     layer_name = f"Story_{story_name}".replace(" ", "_").replace("-", "_")
                     doc.layers.add(layer_name)
                     
+                    scr_lines.append("-LAYER")
+                    scr_lines.append("M")
+                    scr_lines.append(layer_name)
+                    scr_lines.append("")
+                    
+                    # 1. Compute physical pier AABBs
+                    pier_boxes = []
+                    pier_corners_list = []
                     for pier in piers:
-                        cg_x = pier["cg_x"]
-                        cg_y = pier["cg_y"]
-                        L = pier["length_m"]
-                        T = pier["thick_m"]
+                        cg_x = pier["cg_x"] * 1000.0
+                        cg_y = pier["cg_y"] * 1000.0
+                        L = pier["length_m"] * 1000.0
+                        T = pier["thick_m"] * 1000.0
                         angle_rad = pier["angle_rad"]
-                        label = pier["label"]
                         
-                        # Calculate 4 corners of the rectangle
-                        # Local X is along length, Local Y is along thickness
                         dx_L = (L / 2.0) * math.cos(angle_rad)
                         dy_L = (L / 2.0) * math.sin(angle_rad)
-                        
                         dx_T = (T / 2.0) * math.cos(angle_rad + math.pi/2)
                         dy_T = (T / 2.0) * math.sin(angle_rad + math.pi/2)
                         
@@ -410,34 +443,112 @@ else:
                         p3 = (cg_x + dx_L + dx_T, cg_y + dy_L + dy_T)
                         p4 = (cg_x - dx_L + dx_T, cg_y - dy_L + dy_T)
                         
-                        # Draw closed polyline
-                        msp.add_lwpolyline([p1, p2, p3, p4], format="xy", close=True, dxfattribs={"layer": layer_name})
+                        corners = [p1, p2, p3, p4]
+                        pier_corners_list.append(corners)
+                        pier_boxes.append(compute_aabb(corners))
                         
-                        # Intelligent Text Placement
-                        # Determine if vertical or horizontal (using degrees for simplicity)
+                        # DXF Polyline
+                        msp.add_lwpolyline([p1, p2, p3, p4], format="xy", close=True, dxfattribs={"layer": layer_name})
+
+                    placed_label_boxes = []
+                    
+                    # 2. Sequential Collision Avoidance for Labels
+                    for i, pier in enumerate(piers):
+                        cg_x = pier["cg_x"] * 1000.0
+                        cg_y = pier["cg_y"] * 1000.0
+                        L = pier["length_m"] * 1000.0
+                        T = pier["thick_m"] * 1000.0
+                        angle_rad = pier["angle_rad"]
+                        label = pier["label"]
+                        
                         deg = math.degrees(angle_rad) % 180
                         is_vertical = (45 < deg < 135)
                         
-                        text_height = 0.5
-                        offset = 0.5 # gap between pier edge and text
+                        text_height = 500.0
+                        char_w = 350.0
+                        offset = 600.0 # gap between pier edge and text
                         
-                        from ezdxf.enums import TextEntityAlignment
+                        # Generate 4 candidate anchor points
                         if is_vertical:
-                            # Place text to the right
-                            txt_x = cg_x + (T / 2.0) + offset
-                            txt_y = cg_y
-                            align = TextEntityAlignment.MIDDLE_LEFT
+                            # Priorities: Right, Left, Above, Below
+                            candidates = [
+                                (cg_x + (T / 2.0) + offset, cg_y, "MIDDLE_LEFT", TextEntityAlignment.MIDDLE_LEFT),
+                                (cg_x - (T / 2.0) - offset, cg_y, "MIDDLE_RIGHT", TextEntityAlignment.MIDDLE_RIGHT),
+                                (cg_x, cg_y + (L / 2.0) + offset, "BOTTOM_CENTER", TextEntityAlignment.BOTTOM_CENTER),
+                                (cg_x, cg_y - (L / 2.0) - offset, "TOP_CENTER", TextEntityAlignment.TOP_CENTER),
+                            ]
                         else:
-                            # Place text above
-                            txt_x = cg_x
-                            txt_y = cg_y + (T / 2.0) + offset
-                            align = TextEntityAlignment.BOTTOM_CENTER
+                            # Priorities: Above, Below, Right, Left
+                            candidates = [
+                                (cg_x, cg_y + (T / 2.0) + offset, "BOTTOM_CENTER", TextEntityAlignment.BOTTOM_CENTER),
+                                (cg_x, cg_y - (T / 2.0) - offset, "TOP_CENTER", TextEntityAlignment.TOP_CENTER),
+                                (cg_x + (L / 2.0) + offset, cg_y, "MIDDLE_LEFT", TextEntityAlignment.MIDDLE_LEFT),
+                                (cg_x - (L / 2.0) - offset, cg_y, "MIDDLE_RIGHT", TextEntityAlignment.MIDDLE_RIGHT),
+                            ]
                             
-                        text_ent = msp.add_text(label, dxfattribs={"layer": layer_name, "height": text_height})
-                        text_ent.set_placement((txt_x, txt_y), align=align)
+                        best_candidate = candidates[0] # Default if all fail
                         
+                        for cand in candidates:
+                            cand_x, cand_y, align_str, align_enum = cand
+                            cand_box = make_label_box(cand_x, cand_y, label, align_str, char_w, text_height)
+                            
+                            # Check overlap with piers
+                            collision = any(boxes_overlap(cand_box, pbox) for pbox in pier_boxes)
+                            
+                            # Check overlap with previously placed labels
+                            if not collision:
+                                collision = any(boxes_overlap(cand_box, lbox) for lbox in placed_label_boxes)
+                                
+                            if not collision:
+                                best_candidate = cand
+                                break
+                                
+                        final_x, final_y, align_str, align_enum = best_candidate
+                        final_box = make_label_box(final_x, final_y, label, align_str, char_w, text_height)
+                        placed_label_boxes.append(final_box)
+                        
+                        # Place DXF Text
+                        text_ent = msp.add_text(label, dxfattribs={"layer": layer_name, "height": text_height})
+                        text_ent.set_placement((final_x, final_y), align=align_enum)
+                        
+                        # Generate SCR command block
+                        # 1. SCR Polyline for physical pier (centerline + width)
+                        cl_x1 = cg_x - (L / 2.0) * math.cos(angle_rad)
+                        cl_y1 = cg_y - (L / 2.0) * math.sin(angle_rad)
+                        cl_x2 = cg_x + (L / 2.0) * math.cos(angle_rad)
+                        cl_y2 = cg_y + (L / 2.0) * math.sin(angle_rad)
+                        
+                        scr_lines.append("PLINE")
+                        scr_lines.append(f"{cl_x1:.4f},{cl_y1:.4f}")
+                        scr_lines.append("Width")
+                        scr_lines.append(f"{T:.4f}")
+                        scr_lines.append(f"{T:.4f}")
+                        scr_lines.append(f"{cl_x2:.4f},{cl_y2:.4f}")
+                        scr_lines.append("")
+                        
+                        # 2. SCR Text
+                        if align_str == "MIDDLE_LEFT": j_code = "ML"
+                        elif align_str == "MIDDLE_RIGHT": j_code = "MR"
+                        elif align_str == "BOTTOM_CENTER": j_code = "BC"
+                        elif align_str == "TOP_CENTER": j_code = "TC"
+                        else: j_code = "MC"
+                        
+                        scr_lines.append("-TEXT")
+                        scr_lines.append("J")
+                        scr_lines.append(j_code)
+                        scr_lines.append(f"{final_x:.4f},{final_y:.4f}")
+                        scr_lines.append(f"{text_height:.4f}")
+                        scr_lines.append("0")
+                        scr_lines.append(label)
+                        
+                # Save both files
                 doc.saveas(dxf_filename)
+                
+                with open(scr_filename, "w", encoding="utf-8") as f:
+                    f.write("\n".join(scr_lines) + "\n")
+                    
                 print(f"  [OK] Successfully saved DXF to: {dxf_filename}")
+                print(f"  [OK] Successfully saved SCR script to: {scr_filename}")
                 
             except Exception as e:
                 import traceback
