@@ -228,26 +228,47 @@ if pier_names:
             if p_name == pier_names[0]:
                 print(f"  [DEBUG] GetSectionProperties: len={len(ret_sec)}, ret[0]={ret_sec[0]}, ret[1]={ret_sec[1]}")
 
+            import math
+            
             if ret_sec is not None:
                 # Detect format: (retcode=0, count, ...) vs (count, ...)
                 if ret_sec[0] == 0 and isinstance(ret_sec[1], int):
-                    # Format: (retcode, count, stories, ..., width_bot[6], thick_bot[7])
+                    # Format: (retcode, NumberStories, StoryName, AxisAngle, NumAreaObjs, NumLineObjs, WidthBot, ThicknessBot, WidthTop, ThicknessTop, MatProp, CGBotX, CGBotY, CGBotZ, CGTopX, CGTopY, CGTopZ)
                     num_stories = ret_sec[1]
                     story_arr   = ret_sec[2]
+                    axis_angle  = ret_sec[3]
                     width_bot   = ret_sec[6]
                     thick_bot   = ret_sec[7]
+                    cg_bot_x    = ret_sec[11]
+                    cg_bot_y    = ret_sec[12]
                 else:
-                    # Format: (count, stories, ..., width_bot[5], thick_bot[6])
                     num_stories = ret_sec[0]
                     story_arr   = ret_sec[1]
+                    axis_angle  = ret_sec[2]
                     width_bot   = ret_sec[5]
                     thick_bot   = ret_sec[6]
+                    cg_bot_x    = ret_sec[10]
+                    cg_bot_y    = ret_sec[11]
 
                 print(f"\n  Pier '{p_name}' -- {num_stories} story section(s):")
                 for i in range(num_stories):
-                    w_mm = float(width_bot[i])
-                    t_mm = float(thick_bot[i])
+                    w_mm = float(width_bot[i]) * 1000
+                    t_mm = float(thick_bot[i]) * 1000
+                    
+                    cg_x = float(cg_bot_x[i])
+                    cg_y = float(cg_bot_y[i])
+                    ang_rad = math.radians(float(axis_angle[i]))
+                    
+                    # CGBot is the exact center of the pier in plan. WidthBot is the length of the wall.
+                    # Start/End nodes are (WidthBot/2) away from the center along the axis angle.
+                    x1 = cg_x - (float(width_bot[i]) / 2.0) * math.cos(ang_rad)
+                    y1 = cg_y - (float(width_bot[i]) / 2.0) * math.sin(ang_rad)
+                    
+                    x2 = cg_x + (float(width_bot[i]) / 2.0) * math.cos(ang_rad)
+                    y2 = cg_y + (float(width_bot[i]) / 2.0) * math.sin(ang_rad)
+                    
                     print(f"    Story: {str(story_arr[i]):20s}  Width(d)={w_mm:.0f} mm  Thick(b)={t_mm:.0f} mm")
+                    print(f"           Start Node: X={x1:.3f}, Y={y1:.3f} | End Node: X={x2:.3f}, Y={y2:.3f}")
         except Exception as e:
             print(f"  [FAIL] Pier '{p_name}': {e}")
 
@@ -287,64 +308,10 @@ except Exception as e:
     print(f"    [FAIL] Error mapping piers to areas: {e}")
 
 
-# --- Step 3d: Get Start/End Coordinates for each Pier ---
-print(f"\n  --- Pier Coordinates (Centerlines) ---")
-try:
-    if not pier_area_map:
-        print("    [WARN] No pier-to-area map available to extract coordinates.")
-    else:
-        for plabel, areas in sorted(pier_area_map.items()):
-            try:
-                # Get the points of the FIRST area object for this pier
-                # (For multi-area piers, taking the first area is a simplified approach,
-                # but we'll try to collect points from ALL areas for a better bounding box)
-                xs, ys = [], []
-                for aname in areas:
-                    ret_pts = SapModel.AreaObj.GetPoints(aname, 0, [])
-                    # format: (retcode, count, names) or (count, names)
-                    ok, n_pts, pt_names = parse_namelist(ret_pts)
-                    if ok:
-                        for pt in pt_names:
-                            ret_coord = SapModel.PointObj.GetCoordCartesian(pt, 0.0, 0.0, 0.0)
-                            if ret_coord is not None and len(ret_coord) >= 4:
-                                # Determine order: (retcode, x, y, z) vs (x, y, z, retcode)
-                                if isinstance(ret_coord[0], int) and ret_coord[0] == 0:
-                                    x, y = ret_coord[1], ret_coord[2]
-                                else:
-                                    x, y = ret_coord[0], ret_coord[1]
-                                xs.append(float(x))
-                                ys.append(float(y))
-
-                if len(xs) >= 2:
-                    x_min, x_max = min(xs), max(xs)
-                    y_min, y_max = min(ys), max(ys)
-                    dx = x_max - x_min
-                    dy = y_max - y_min
-                    
-                    # Assume the longer dimension is the wall length (centerline)
-                    if dx >= dy:
-                        mid_y = (y_min + y_max) / 2
-                        x1, y1 = x_min, mid_y
-                        x2, y2 = x_max, mid_y
-                        orient = "Horizontal"
-                    else:
-                        mid_x = (x_min + x_max) / 2
-                        x1, y1 = mid_x, y_min
-                        x2, y2 = mid_x, y_max
-                        orient = "Vertical"
-                        
-                    length = max(dx, dy)
-                    print(f"    Pier '{plabel}' ({orient}, L={length:.0f} mm):")
-                    print(f"      Start Node: X={x1:.0f}, Y={y1:.0f}")
-                    print(f"      End Node:   X={x2:.0f}, Y={y2:.0f}")
-                else:
-                    print(f"    Pier '{plabel}': Could not extract enough coordinates.")
-            except Exception as e:
-                print(f"    [FAIL] Pier '{plabel}' coordinate extraction failed: {e}")
-except Exception as e:
-    print(f"  [FAIL] Pier coordinate extraction error: {e}")
 
 print("\n" + "=" * 60)
 print("  CELL 3 COMPLETE")
 print("=" * 60)
 
+
+# %%
