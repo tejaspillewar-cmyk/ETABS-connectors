@@ -56,6 +56,9 @@ class FDRConfig:
     fck: int = 30
     """Default concrete grade (MPa). Used when pier-specific fck = 0."""
 
+    text_height: int = 100
+    """Text height for CAD exports."""
+
     cad_offset_1: int = 300
     """Label offset from pier center (mm)."""
 
@@ -194,9 +197,10 @@ class FDRTool:
     >>> results = tool.run_all()
     """
 
-    def __init__(self, SapModel, config: FDRConfig | None = None):
+    def __init__(self, SapModel, config: FDRConfig | None = None, log=None):
         self.SapModel = SapModel
         self.config = config or FDRConfig()
+        self.log = log or print
 
         # Internal DataFrames populated by extraction/calculation steps
         self._df_raw: pd.DataFrame = pd.DataFrame()
@@ -234,8 +238,8 @@ class FDRTool:
         SM = self.SapModel
         cfg = self.config
 
-        print("Extracting pier data from ETABS...")
-        print("(Make sure your model is analyzed and results are available)")
+        self.log("Extracting pier data from ETABS...")
+        self.log("(Make sure your model is analyzed and results are available)")
 
         SM.Results.Setup.DeselectAllCasesAndCombosForOutput()
 
@@ -248,13 +252,13 @@ class FDRTool:
 
         if selected_combos is None:
             combo_names = available
-            print(f"  No combo selection given - using all {len(combo_names)} available combos.")
+            self.log(f"  No combo selection given - using all {len(combo_names)} available combos.")
         else:
             invalid = [c for c in selected_combos if c not in available]
             if invalid:
                 raise ValueError(f"These combo names don't exist in the model: {invalid}")
             combo_names = selected_combos
-            print(f"  Using {len(combo_names)} user-selected combos out of {len(available)} available.")
+            self.log(f"  Using {len(combo_names)} user-selected combos out of {len(available)} available.")
 
         for combo_name in combo_names:
             SM.Results.Setup.SetComboSelectedForOutput(combo_name, True)
@@ -292,7 +296,7 @@ class FDRTool:
             m2_values     = ret[9]
             m3_values     = ret[10]
 
-        print(f"  Extracted {num_results} pier force rows.")
+        self.log(f"  Extracted {num_results} pier force rows.")
 
         # --- Get Pier Section Properties ---
         ret_piers = SM.PierLabel.GetNameList(0, [])
@@ -325,7 +329,7 @@ class FDRTool:
                             'fck': cfg.fck,
                         }
             except Exception as e:
-                print(f"  Warning: Could not get section for pier {p_name}: {e}")
+                self.log(f"  Warning: Could not get section for pier {p_name}: {e}")
 
         # --- Build raw data DataFrame (bottom-location rows only) ---
         raw_rows = []
@@ -341,7 +345,7 @@ class FDRTool:
             })
 
         self._df_raw = pd.DataFrame(raw_rows)
-        print(f"  Filtered to {len(self._df_raw)} bottom-location rows.")
+        self.log(f"  Filtered to {len(self._df_raw)} bottom-location rows.")
 
         # --- Group by (Story, Pier_ID) → Pmin/Pmax envelopes ---
         wind_kw = cfg.wind_keywords
@@ -393,10 +397,10 @@ class FDRTool:
             .reset_index(drop=True)
         )
 
-        print(f"\nEXTRACTION COMPLETE: {len(self._df_data)} unique (Story, Pier) entries")
-        print(f"  Stories: {self._df_data['Story'].nunique()} | "
+        self.log(f"\nEXTRACTION COMPLETE: {len(self._df_data)} unique (Story, Pier) entries")
+        self.log(f"  Stories: {self._df_data['Story'].nunique()} | "
               f"Piers: {self._df_data['Pier_ID'].nunique()}")
-        print(self._df_data[
+        self.log(self._df_data[
             ['Story', 'Pier_ID', 'b', 'd', 'fck', 'Pmin', 'Pmax']
         ].head(10).to_string(index=False))
 
@@ -408,7 +412,7 @@ class FDRTool:
 
     def extract_pier_coordinates(self) -> pd.DataFrame:
         SM = self.SapModel
-        print("Extracting pier coordinates...")
+        self.log("Extracting pier coordinates...")
 
         # --- Build a reverse lookup: pier name -> list of area object names ---
         ret_areas = SM.AreaObj.GetNameList(0, [])
@@ -478,9 +482,9 @@ class FDRTool:
         coords_found = (
             (self._df_data['x1'] != 0) | (self._df_data['y1'] != 0)
         ).sum()
-        print(f"Coordinates extracted for {coords_found}/{len(self._df_data)} piers.")
+        self.log(f"Coordinates extracted for {coords_found}/{len(self._df_data)} piers.")
         if coords_found < len(self._df_data):
-            print("  Piers without coordinates will be skipped in CAD export.")
+            self.log("  Piers without coordinates will be skipped in CAD export.")
 
         return self._df_data.copy()
 
@@ -503,14 +507,14 @@ class FDRTool:
             Full results DataFrame with all calculated columns.
         """
         cfg = self.config
-        print("Running structural calculations...")
+        self.log("Running structural calculations...")
 
         # Apply story filter if set
         if cfg.story_filter:
             self._df_calc = self._df_data[
                 self._df_data['Story'] == cfg.story_filter
             ].copy()
-            print(f"  Filtered to story: {cfg.story_filter} "
+            self.log(f"  Filtered to story: {cfg.story_filter} "
                   f"({len(self._df_calc)} piers)")
         else:
             self._df_calc = self._df_data.copy()
@@ -566,25 +570,26 @@ class FDRTool:
         # ── Summary ─────────────────────────────────────────────────────
 
         summary = self.get_summary()
-        print(f"\n{'='*55}")
-        print(f"  CALCULATION SUMMARY")
-        print(f"{'='*55}")
-        print(f"  Total Piers Analyzed:   {summary['total_piers']}")
-        print(f"  Max Pt%:                {summary['max_pt']:.2f}%")
-        print(f"  0.4fck Inadequate:      {summary['inadequate_04']}")
-        print(f"  Ductile Detailing Reqd: {summary['ductile_reqd']}")
-        print(f"{'='*55}")
+        self.log(f"\n{'='*55}")
+        self.log(f"  CALCULATION SUMMARY")
+        self.log(f"{'='*55}")
+        self.log(f"  Total Piers Analyzed:   {summary['total_piers']}")
+        self.log(f"  Max Pt%:                {summary['max_pt']:.2f}%")
+        self.log(f"  0.4fck Inadequate:      {summary['inadequate_04']}")
+        self.log(f"  Ductile Detailing Reqd: {summary['ductile_reqd']}")
+        self.log(f"{'='*55}")
 
         self._df_calc = df
         return self._df_calc.copy()
 
     def _place_cad_labels(self, df: pd.DataFrame) -> None:
-        """Compute collision-free label positions for CAD export."""
+        """Compute label positions for CAD export using uniform spacing."""
         cfg = self.config
-        CHAR_W = 70
-        TEXT_H = 120
-
-        # Build pier bounding boxes
+        
+        # We will use cad_offset_1 as the gap from the pier edge to the text center.
+        gap = cfg.cad_offset_1
+        
+        # Calculate bounding boxes of piers to avoid overlaps
         pier_boxes = []
         for _, row in df.iterrows():
             corners = compute_pier_corners(
@@ -599,75 +604,83 @@ class FDRTool:
                 'xMin': min(xs), 'xMax': max(xs),
                 'yMin': min(ys), 'yMax': max(ys),
             })
-
+            
         placed_labels = []
+        
+        CHAR_W = 70
+        TEXT_H = cfg.text_height
+        # Text block is 4 lines (Label, Value, CD_04, CD_02, AsValue). 
+        # Actually in export_cad, it exports 5 items, but typically spaced by cad_offset_2 and cad_offset_3.
+        # It's roughly offset_2 down, then offset_3 down.
 
         for idx, row in df.iterrows():
-            x1, y1, x2, y2 = row['x1'], row['y1'], row['x2'], row['y2']
+            x1, y1, x2, y2, b = row['x1'], row['y1'], row['x2'], row['y2'], row['b']
             mid_x = (x1 + x2) / 2
             mid_y = (y1 + y2) / 2
+            dx = abs(x2 - x1)
+            dy = abs(y2 - y1)
+            
             pier_key = f"{row['Story']}_{row['Pier_ID']}"
-            other_boxes = [b for b in pier_boxes if b['id'] != pier_key]
-            is_horiz = (
-                (y1 == y2) or
-                (x1 != x2 and abs(y2 - y1) < abs(x2 - x1))
-            )
-
+            other_boxes = [box for box in pier_boxes if box['id'] != pier_key]
+            
+            is_horiz = (dy < dx) or (y1 == y2)
+            
+            # The edge of the pier from the center:
+            edge_x = max(dx / 2, b / 2) if not is_horiz else b / 2
+            edge_y = max(dy / 2, b / 2) if is_horiz else b / 2
+            
+            # Try to place text block 
             if is_horiz:
+                # Primary: Below
                 candidates = [
-                    (mid_x, mid_y + cfg.cad_offset_1),
-                    (mid_x, mid_y - cfg.cad_offset_1),
-                    (mid_x + cfg.cad_offset_1, mid_y),
-                    (mid_x - cfg.cad_offset_1, mid_y),
+                    (mid_x, mid_y - edge_y - gap),
+                    (mid_x, mid_y + edge_y + gap),
+                    (mid_x + edge_x + gap, mid_y),
+                    (mid_x - edge_x - gap, mid_y),
                 ]
             else:
+                # Primary: Right
                 candidates = [
-                    (mid_x + cfg.cad_offset_1, mid_y),
-                    (mid_x - cfg.cad_offset_1, mid_y),
-                    (mid_x, mid_y + cfg.cad_offset_1),
-                    (mid_x, mid_y - cfg.cad_offset_1),
+                    (mid_x + edge_x + gap, mid_y),
+                    (mid_x - edge_x - gap, mid_y),
+                    (mid_x, mid_y - edge_y - gap),
+                    (mid_x, mid_y + edge_y + gap),
                 ]
-
-            max_text_len = max(len(row['Pier_ID']), 6)
+                
+            max_text_len = max(len(str(row['Pier_ID'])), 6)
             text_half_w = (max_text_len * CHAR_W) / 2
-
+            
             def make_label_box(lx, ly):
+                # Total block goes from ly down to ly - (cfg.cad_offset_2 + cfg.cad_offset_3)
                 return {
                     'xMin': lx - text_half_w,
                     'xMax': lx + text_half_w,
-                    'yMin': min(ly, ly + cfg.cad_offset_2) - TEXT_H / 2,
-                    'yMax': max(ly, ly + cfg.cad_offset_2) + TEXT_H / 2,
+                    'yMin': min(ly, ly - cfg.cad_offset_2 - cfg.cad_offset_3) - TEXT_H / 2,
+                    'yMax': max(ly, ly - cfg.cad_offset_2 - cfg.cad_offset_3) + TEXT_H / 2,
                 }
-
+                
             label_x, label_y = candidates[0]
             placed = False
-
+            
             for cx, cy in candidates:
                 text_box = make_label_box(cx, cy)
-                hits_pier = any(boxes_overlap(text_box, b) for b in other_boxes)
-                hits_label = any(
-                    boxes_overlap(text_box, lb) for lb in placed_labels
-                )
+                hits_pier = any(boxes_overlap(text_box, pbox) for pbox in other_boxes)
+                hits_label = any(boxes_overlap(text_box, lbox) for lbox in placed_labels)
                 if not hits_pier and not hits_label:
                     label_x, label_y = cx, cy
                     placed_labels.append(text_box)
                     placed = True
                     break
-
+                    
             if not placed:
                 placed_labels.append(make_label_box(label_x, label_y))
-
-            value_x = label_x
-            value_y = label_y + cfg.cad_offset_2
-            as_value_x = value_x
-            as_value_y = value_y + cfg.cad_offset_3
-
+                
             df.at[idx, 'labelX'] = label_x
             df.at[idx, 'labelY'] = label_y
-            df.at[idx, 'valueX'] = value_x
-            df.at[idx, 'valueY'] = value_y
-            df.at[idx, 'asValueX'] = as_value_x
-            df.at[idx, 'asValueY'] = as_value_y
+            df.at[idx, 'valueX'] = label_x
+            df.at[idx, 'valueY'] = label_y - cfg.cad_offset_2
+            df.at[idx, 'asValueX'] = label_x
+            df.at[idx, 'asValueY'] = label_y - cfg.cad_offset_2 - cfg.cad_offset_3
 
     # -----------------------------------------------------------------
     # Summary
@@ -708,13 +721,13 @@ class FDRTool:
             'As_min', 'Asc', 'Ast', 'As_max', 'Pt_percent', 'Governing',
         ]
 
-        print("=" * 100)
-        print("  OBJECTIVE 1: REQUIRED Pt% ANALYSIS")
-        print("  Asc = compression steel (from Pmin) | "
+        self.log("=" * 100)
+        self.log("  OBJECTIVE 1: REQUIRED Pt% ANALYSIS")
+        self.log("  Asc = compression steel (from Pmin) | "
               "Ast = tension steel (from Pmax)")
-        print(f"  As_min = 0.0025 x b x d | As_max = max(Asc, Ast, As_min) "
+        self.log(f"  As_min = 0.0025 x b x d | As_max = max(Asc, Ast, As_min) "
               f"| fy = {self.config.fy} MPa")
-        print("=" * 100)
+        self.log("=" * 100)
 
         display = df[pt_cols].copy()
         display['Pt_percent'] = display['Pt_percent'].round(3)
@@ -722,18 +735,18 @@ class FDRTool:
             display[col] = display[col].round(0)
         for col in ('Pmin', 'Pmax'):
             display[col] = display[col].round(1)
-        print(display.to_string(index=False))
+        self.log(display.to_string(index=False))
 
         tension = df[df['Governing'] == 'Tension']
         compression = df[df['Governing'] == 'Compression']
         minimum = df[df['Governing'] == 'Minimum']
-        print(f"\n  Governed by Tension:     {len(tension)}")
-        print(f"  Governed by Compression: {len(compression)}")
-        print(f"  Governed by Minimum:     {len(minimum)}")
+        self.log(f"\n  Governed by Tension:     {len(tension)}")
+        self.log(f"  Governed by Compression: {len(compression)}")
+        self.log(f"  Governed by Minimum:     {len(minimum)}")
         if len(tension) > 0:
-            print(f"  Max Pt% (Tension):       {tension['Pt_percent'].max():.2f}%")
+            self.log(f"  Max Pt% (Tension):       {tension['Pt_percent'].max():.2f}%")
         if len(compression) > 0:
-            print(f"  Max Pt% (Compression):   "
+            self.log(f"  Max Pt% (Compression):   "
                   f"({compression['Pt_percent'].max():.2f}%)")
 
     def print_04fck_results(self) -> None:
@@ -744,30 +757,30 @@ class FDRTool:
             'Combo_Pmin_NoWind', 'CD_Ratio_04', 'Status_04',
         ]
 
-        print("=" * 100)
-        print("  OBJECTIVE 2: 0.4 fck CAPACITY/DEMAND CHECK")
-        print("  Pu_capacity = 0.4 x fck x b x d / 1000  |  "
+        self.log("=" * 100)
+        self.log("  OBJECTIVE 2: 0.4 fck CAPACITY/DEMAND CHECK")
+        self.log("  Pu_capacity = 0.4 x fck x b x d / 1000  |  "
               "Demand = |Pmin_NoWind|")
-        print("  Status: Adequate if C/D >= 1.0")
-        print("=" * 100)
+        self.log("  Status: Adequate if C/D >= 1.0")
+        self.log("=" * 100)
 
         display = df[cd04_cols].copy()
         display['Pu_capacity_04'] = display['Pu_capacity_04'].round(1)
         display['Demand_04'] = display['Demand_04'].round(1)
         display['CD_Ratio_04'] = display['CD_Ratio_04'].round(2)
-        print(display.to_string(index=False))
+        self.log(display.to_string(index=False))
 
         inadequate = (df['Status_04'] == 'Inadequate').sum()
-        print(f"\n  ADEQUATE:   {(df['Status_04'] == 'Adequate').sum()}")
-        print(f"  INADEQUATE: {inadequate}")
+        self.log(f"\n  ADEQUATE:   {(df['Status_04'] == 'Adequate').sum()}")
+        self.log(f"  INADEQUATE: {inadequate}")
 
         if inadequate > 0:
-            print("\n  INADEQUATE PIERS:")
+            self.log("\n  INADEQUATE PIERS:")
             inad = df[df['Status_04'] == 'Inadequate'][
                 ['Story', 'Pier_ID', 'CD_Ratio_04', 'Demand_04',
                  'Pu_capacity_04']
             ]
-            print(inad.to_string(index=False))
+            self.log(inad.to_string(index=False))
 
     def print_02fck_results(self) -> None:
         """Print the 0.2 fck Boundary check table (Cell 9)."""
@@ -777,30 +790,30 @@ class FDRTool:
             'Pu_02fck', 'CD_Ratio_02', 'Ductile_Detailing_Reqd',
         ]
 
-        print("=" * 100)
-        print("  OBJECTIVE 3: 0.2 fck BOUNDARY CHECK (DUCTILE DETAILING)")
-        print("  Pu_02fck = 0.2 x fck x b x d / 1000  |  "
+        self.log("=" * 100)
+        self.log("  OBJECTIVE 3: 0.2 fck BOUNDARY CHECK (DUCTILE DETAILING)")
+        self.log("  Pu_02fck = 0.2 x fck x b x d / 1000  |  "
               "Demand = |Pmin_NoWind|")
-        print("  Ductile detailing required if C/D < 1.0")
-        print("=" * 100)
+        self.log("  Ductile detailing required if C/D < 1.0")
+        self.log("=" * 100)
 
         display = df[cd02_cols].copy()
         display['Demand_02'] = display['Demand_02'].round(1)
         display['Pu_02fck'] = display['Pu_02fck'].round(1)
         display['CD_Ratio_02'] = display['CD_Ratio_02'].round(2)
-        print(display.to_string(index=False))
+        self.log(display.to_string(index=False))
 
         ductile_reqd = (df['Ductile_Detailing_Reqd'] == 'Yes').sum()
-        print(f"\n  Ductile Detailing NOT Required: "
+        self.log(f"\n  Ductile Detailing NOT Required: "
               f"{(df['Ductile_Detailing_Reqd'] == 'No').sum()}")
-        print(f"  Ductile Detailing REQUIRED:     {ductile_reqd}")
+        self.log(f"  Ductile Detailing REQUIRED:     {ductile_reqd}")
 
         if ductile_reqd > 0:
-            print("\n  PIERS REQUIRING DUCTILE DETAILING:")
+            self.log("\n  PIERS REQUIRING DUCTILE DETAILING:")
             duct = df[df['Ductile_Detailing_Reqd'] == 'Yes'][
                 ['Story', 'Pier_ID', 'CD_Ratio_02', 'Demand_02', 'Pu_02fck']
             ]
-            print(duct.to_string(index=False))
+            self.log(duct.to_string(index=False))
 
     # -----------------------------------------------------------------
     # EXPORT: CAD Scripts
@@ -833,7 +846,7 @@ class FDRTool:
             filepath = os.path.join(output_dir, filename)
             with open(filepath, 'w') as f:
                 f.write('\n'.join(rows))
-            print(f"  {name}: {len(rows)} rows -> {filename}")
+            self.log(f"  {name}: {len(rows)} rows -> {filename}")
             generated_files.append(filepath)
             return filepath
 
@@ -914,9 +927,9 @@ class FDRTool:
                 f"{c3[0]:.1f},{c3[1]:.1f} {c4[0]:.1f},{c4[1]:.1f} C"
             )
 
-        print(f"\n{'='*60}")
-        print(f"  CAD EXPORT -- saved to: {output_dir}")
-        print(f"{'='*60}")
+        self.log(f"\n{'='*60}")
+        self.log(f"  CAD EXPORT -- saved to: {output_dir}")
+        self.log(f"{'='*60}")
 
         _save("PierLabels", label_rows)
         _save("RequiredPt", pt_rows)
@@ -926,10 +939,10 @@ class FDRTool:
         _save("PierRectangles", rect_rows)
 
         if skipped_piers:
-            print(f"\n  {len(skipped_piers)} pier(s) skipped for rectangles "
+            self.log(f"\n  {len(skipped_piers)} pier(s) skipped for rectangles "
                   f"(no coords/thickness)")
 
-        print(f"\nAll CAD scripts saved. "
+        self.log(f"\nAll CAD scripts saved. "
               f"Paste contents into AutoCAD command line.")
 
         return generated_files
@@ -944,8 +957,7 @@ class FDRTool:
         Parameters
         ----------
         output_path : str, optional
-            Full path for the .xlsx file. Defaults to
-            FDR_Report_<timestamp>.xlsx in the script directory.
+            Full path for the .xlsx file. If None, prompts via filedialog.
 
         Returns
         -------
@@ -953,18 +965,40 @@ class FDRTool:
             Path to the generated Excel file.
         """
         try:
-            import openpyxl  # noqa: F401
+            import openpyxl
+            from openpyxl.styles import PatternFill, Border, Side, Font
+            from openpyxl.utils import get_column_letter
         except ImportError:
-            print("Installing openpyxl for Excel export...")
+            self.log("Installing openpyxl for Excel export...")
             import subprocess
             subprocess.check_call(['pip', 'install', 'openpyxl'])
+            import openpyxl
+            from openpyxl.styles import PatternFill, Border, Side, Font
+            from openpyxl.utils import get_column_letter
 
         if output_path is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-            output_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                f"FDR_Report_{timestamp}.xlsx",
+            import tkinter as tk
+            from tkinter import filedialog
+            
+            root = tk.Tk()
+            root.withdraw()
+            
+            try:
+                model_dir = os.path.dirname(self.SapModel.GetModelFilename())
+            except Exception:
+                model_dir = os.path.expanduser("~")
+                
+            output_path = filedialog.asksaveasfilename(
+                title="Save FDR Excel Report",
+                initialdir=model_dir,
+                initialfile=self.default_excel_name(),
+                defaultextension=".xlsx",
+                filetypes=[("Excel workbook", "*.xlsx"), ("All files", "*.*")]
             )
+            root.destroy()
+            if not output_path:
+                self.log("Excel export cancelled.")
+                return ""
 
         df = self._df_calc
         export_cols = [
@@ -979,35 +1013,186 @@ class FDRTool:
         ]
         export_cols = [c for c in export_cols if c in df.columns]
 
+        # Prepare AutoCAD Commands data
+        cad_rows = []
+        if not df.empty:
+            for _, r in df.iterrows():
+                # Rectangle
+                x1, y1, x2, y2, b = r['x1'], r['y1'], r['x2'], r['y2'], r['b']
+                if not (x1 == 0 and y1 == 0 and x2 == 0 and y2 == 0) and b > 0:
+                    corners = compute_pier_corners(x1, y1, x2, y2, b)
+                    if corners is not None:
+                        c1, c2, c3, c4 = corners
+                        cad_rows.append({'Pier_ID': r['Pier_ID'], 'Type': 'Rectangle', 
+                                        'Command': f"PLINE {c1[0]:.1f},{c1[1]:.1f} {c2[0]:.1f},{c2[1]:.1f} {c3[0]:.1f},{c3[1]:.1f} {c4[0]:.1f},{c4[1]:.1f} C"})
+                # Label
+                if 'labelX' in r and not pd.isna(r['labelX']):
+                    cad_rows.append({'Pier_ID': r['Pier_ID'], 'Type': 'Label', 
+                                    'Command': f"-text\t{r['labelX']:.1f},{r['labelY']:.1f}\t100\t0\t{r['Pier_ID']}"})
+                # Required Pt%
+                if 'valueX' in r and not pd.isna(r['valueX']):
+                    is_comp = r.get('As_max', 0) == r.get('Asc', -1) and r.get('Asc', 0) > 0
+                    pt_label = f"({r['Pt_percent']:.2f}%)" if is_comp else f"{r['Pt_percent']:.2f}%"
+                    cad_rows.append({'Pier_ID': r['Pier_ID'], 'Type': 'Required Pt%', 
+                                    'Command': f"-text\t{r['valueX']:.1f},{r['valueY']:.1f}\t100\t0\t{pt_label}"})
+                # As Required
+                if 'asValueX' in r and not pd.isna(r['asValueX']):
+                    is_comp = r.get('As_max', 0) == r.get('Asc', -1) and r.get('Asc', 0) > 0
+                    as_label = f"({r['As_max']:.0f})" if is_comp else f"{r['As_max']:.0f}"
+                    cad_rows.append({'Pier_ID': r['Pier_ID'], 'Type': 'As Required', 
+                                    'Command': f"-text\t{r['asValueX']:.1f},{r['asValueY']:.1f}\t100\t0\t{as_label}"})
+
+        df_cad = pd.DataFrame(cad_rows)
+
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            df[export_cols].to_excel(
-                writer, sheet_name='Full Analysis', index=False
-            )
+            df[export_cols].to_excel(writer, sheet_name='Full Analysis', index=False)
             df[['Story', 'Pier_ID', 'b', 'd', 'fck',
                 'Pmin', 'Combo_Pmin', 'Pmax', 'Combo_Pmax',
                 'As_min', 'Asc', 'Ast', 'As_max',
-                'Pt_percent', 'Governing']].to_excel(
-                writer, sheet_name='Required Pt', index=False
-            )
+                'Pt_percent', 'Governing']].to_excel(writer, sheet_name='Required Pt', index=False)
             df[['Story', 'Pier_ID', 'Pu_capacity_04', 'Demand_04',
-                'Combo_Pmin_NoWind', 'CD_Ratio_04', 'Status_04']].to_excel(
-                writer, sheet_name='0.4fck CD Check', index=False
-            )
+                'Combo_Pmin_NoWind', 'CD_Ratio_04', 'Status_04']].to_excel(writer, sheet_name='0.4fck CD Check', index=False)
             df[['Story', 'Pier_ID', 'Demand_02', 'Combo_Pmin_NoWind',
                 'Pu_02fck', 'CD_Ratio_02',
-                'Ductile_Detailing_Reqd']].to_excel(
-                writer, sheet_name='0.2fck Boundary', index=False
-            )
+                'Ductile_Detailing_Reqd']].to_excel(writer, sheet_name='0.2fck Boundary', index=False)
+            if not df_cad.empty:
+                df_cad.to_excel(writer, sheet_name='AutoCAD Commands', index=False)
             if len(self._df_raw) > 0:
-                self._df_raw.to_excel(
-                    writer, sheet_name='Raw Envelope', index=False
-                )
+                self._df_raw.to_excel(writer, sheet_name='Raw Envelope', index=False)
 
-        print(f"Excel report saved: {output_path}")
-        print("  Sheets: Full Analysis | Required Pt | "
-              "0.4fck CD Check | 0.2fck Boundary | Raw Envelope")
+            # Apply Formatting
+            workbook = writer.book
+            thin_border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                 top=Side(style='thin'), bottom=Side(style='thin'))
+            header_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+            header_font = Font(bold=True)
+
+            for sheet_name in workbook.sheetnames:
+                ws = workbook[sheet_name]
+                for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+                    for cell in row:
+                        cell.border = thin_border
+                        if cell.row == 1:
+                            cell.fill = header_fill
+                            cell.font = header_font
+                
+                # Auto-adjust column widths based on the length of column headers
+                for col in ws.columns:
+                    max_length = 0
+                    column = col[0].column_letter
+                    for cell in col:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = (max_length + 2)
+                    ws.column_dimensions[column].width = adjusted_width
+
+        self.log(f"Excel report saved: {output_path}")
+        self.log("  Sheets: Full Analysis | Required Pt | 0.4fck CD Check | 0.2fck Boundary | AutoCAD Commands | Raw Envelope")
 
         return output_path
+
+    def get_stories(self) -> list[str]:
+        """Return a list of all story names defined in the model."""
+        ret = self.SapModel.Story.GetNameList(0, [])
+        ok, n, names = parse_namelist(ret)
+        if not ok:
+            return []
+        return list(names)
+
+    def stories_in_results(self) -> list[str]:
+        """Return a list of stories present in the calculation results."""
+        if self._df_calc is None or self._df_calc.empty:
+            return []
+        return self._df_calc['Story'].unique().tolist()
+
+    def default_excel_name(self) -> str:
+        """Default filename for Excel export."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        return f"FDR_Report_{timestamp}.xlsx"
+
+    def default_dxf_name(self, story: str) -> str:
+        """Default filename for DXF export."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        s_safe = "".join(c if c.isalnum() else "_" for c in story)
+        return f"FDR_{s_safe}_{timestamp}.dxf"
+
+    def export_dxf(self, filepath: str, story: str) -> str:
+        """Export analysis results for a specific story to DXF using ezdxf.
+
+        Parameters
+        ----------
+        filepath : str
+            Full path for the .dxf file.
+        story : str
+            The name of the story to export.
+
+        Returns
+        -------
+        str
+            Path to the generated DXF file.
+        """
+        try:
+            import ezdxf
+        except ImportError:
+            self.log("Installing ezdxf for DXF export...")
+            import subprocess
+            subprocess.check_call(['pip', 'install', 'ezdxf'])
+            import ezdxf
+
+        df = self._df_calc[self._df_calc['Story'] == story]
+        if df.empty:
+            self.log(f"No results found for story: {story}")
+            return ""
+
+        doc = ezdxf.new('R2010')
+        doc.header['$INSUNITS'] = 4  # millimeters
+        msp = doc.modelspace()
+
+        # Add layers
+        doc.layers.add(name="PierRectangles", color=ezdxf.colors.WHITE)
+        doc.layers.add(name="PierLabels", color=ezdxf.colors.YELLOW)
+        doc.layers.add(name="RequiredPt", color=ezdxf.colors.CYAN)
+        doc.layers.add(name="AsRequired", color=ezdxf.colors.MAGENTA)
+        
+        TEXT_H = self.config.text_height
+
+        for _, r in df.iterrows():
+            # Pier Rectangle
+            x1, y1, x2, y2, b = r['x1'], r['y1'], r['x2'], r['y2'], r['b']
+            if not (x1 == 0 and y1 == 0 and x2 == 0 and y2 == 0) and b > 0:
+                corners = compute_pier_corners(x1, y1, x2, y2, b)
+                if corners is not None:
+                    c1, c2, c3, c4 = corners
+                    msp.add_lwpolyline([c1, c2, c3, c4], close=True, dxfattribs={'layer': 'PierRectangles'})
+
+            # Label
+            if 'labelX' in r and not pd.isna(r['labelX']):
+                msp.add_text(str(r['Pier_ID']), dxfattribs={'layer': 'PierLabels', 'height': TEXT_H}).set_placement(
+                    (r['labelX'], r['labelY']), align=ezdxf.enums.TextEntityAlignment.CENTER
+                )
+
+            # Required Pt%
+            if 'valueX' in r and not pd.isna(r['valueX']):
+                is_comp = r.get('As_max', 0) == r.get('Asc', -1) and r.get('Asc', 0) > 0
+                pt_label = f"({r['Pt_percent']:.2f}%)" if is_comp else f"{r['Pt_percent']:.2f}%"
+                msp.add_text(pt_label, dxfattribs={'layer': 'RequiredPt', 'height': TEXT_H}).set_placement(
+                    (r['valueX'], r['valueY']), align=ezdxf.enums.TextEntityAlignment.CENTER
+                )
+
+            # As Required
+            if 'asValueX' in r and not pd.isna(r['asValueX']):
+                is_comp = r.get('As_max', 0) == r.get('Asc', -1) and r.get('Asc', 0) > 0
+                as_label = f"({r['As_max']:.0f})" if is_comp else f"{r['As_max']:.0f}"
+                msp.add_text(as_label, dxfattribs={'layer': 'AsRequired', 'height': TEXT_H}).set_placement(
+                    (r['asValueX'], r['asValueY']), align=ezdxf.enums.TextEntityAlignment.CENTER
+                )
+
+        doc.saveas(filepath)
+        self.log(f"DXF saved: {filepath}")
+        return filepath
 
     # -----------------------------------------------------------------
     # RUN ALL — One-shot full pipeline
@@ -1066,71 +1251,69 @@ class FDRTool:
 # =================================================================
 # CELL 1: CONNECT TO ETABS (Standalone / Interactive)
 # =================================================================
-import comtypes.client
-import psutil
+if __name__ == '__main__':
+    import comtypes.client
+    import psutil
 
-# 1. Find the running ETABS process
-etabs_processes = [
-    p.info for p in psutil.process_iter(['pid', 'name'])
-    if p.info['name'] and 'ETABS' in p.info['name'].upper()
-]
+    # 1. Find the running ETABS process
+    etabs_processes = [
+        p.info for p in psutil.process_iter(['pid', 'name'])
+        if p.info['name'] and 'ETABS' in p.info['name'].upper()
+    ]
 
-if not etabs_processes:
-    raise RuntimeError("No running ETABS.exe process found.")
-elif len(etabs_processes) > 1:
-    print("Multiple ETABS processes found:")
-    for p in etabs_processes:
-        print(f"  PID {p['pid']}  ({p['name']})")
-    raise RuntimeError("Multiple ETABS instances running — specify the correct PID manually instead of auto-picking.")
-else:
-    pid = etabs_processes[0]['pid']
-    print(f"Found ETABS process: PID {pid}")
+    if not etabs_processes:
+        raise RuntimeError("No running ETABS.exe process found.")
+    elif len(etabs_processes) > 1:
+        print("Multiple ETABS processes found:")
+        for p in etabs_processes:
+            print(f"  PID {p['pid']}  ({p['name']})")
+        raise RuntimeError("Multiple ETABS instances running — specify the correct PID manually instead of auto-picking.")
+    else:
+        pid = etabs_processes[0]['pid']
+        print(f"Found ETABS process: PID {pid}")
 
-# 2. Attach to that exact process
-helper = comtypes.client.CreateObject('ETABSv1.Helper')
-helper = helper.QueryInterface(comtypes.gen.ETABSv1.cHelper)
+    # 2. Attach to that exact process
+    helper = comtypes.client.CreateObject('ETABSv1.Helper')
+    helper = helper.QueryInterface(comtypes.gen.ETABSv1.cHelper)
 
-myETABSObject = helper.GetObjectProcess("CSI.ETABS.API.ETABSObject", pid)
+    myETABSObject = helper.GetObjectProcess("CSI.ETABS.API.ETABSObject", pid)
 
-if myETABSObject is None:
-    raise RuntimeError(f"GetObjectProcess returned None for PID {pid} — attach failed.")
+    if myETABSObject is None:
+        raise RuntimeError(f"GetObjectProcess returned None for PID {pid} — attach failed.")
 
-myETABSObject = myETABSObject.QueryInterface(comtypes.gen.ETABSv1.cOAPI)
-SapModel = myETABSObject.SapModel
+    myETABSObject = myETABSObject.QueryInterface(comtypes.gen.ETABSv1.cOAPI)
+    SapModel = myETABSObject.SapModel
 
-print("Attached successfully. Active file:", SapModel.GetModelFilename())
+    print("Attached successfully. Active file:", SapModel.GetModelFilename())
 
+    # =================================================================
+    # CELL 1.5: CHECK AVAILABLE COMBOS
+    # =================================================================
+    config = FDRConfig(
+        fy=500,
+        fck=30,
+        story_filter=None,  # Set to e.g. "Story 1" to filter
+    )
+    tool = FDRTool(SapModel, config)
 
-# %%
-# =================================================================
-# CELL 1.5: CHECK AVAILABLE COMBOS
-# =================================================================
-config = FDRConfig(
-    fy=500,
-    fck=30,
-    story_filter=None,  # Set to e.g. "Story 1" to filter
-)
-tool = FDRTool(SapModel, config)
+    available = tool.get_available_combos()
+    print(f"{len(available)} combos found:")
+    for c in available:
+        print(" ", c)
 
-available = tool.get_available_combos()
-print(f"{len(available)} combos found:")
-for c in available:
-    print(" ", c)
+    # Example: If you only want to run specific combos, uncomment and list them:
+    # my_combos = ["STD_G+40_ULS_D1a", "STD_G+40_ULS_D1b"]
+    my_combos = None
 
-# Example: If you only want to run specific combos, uncomment and list them:
-# my_combos = ["STD_G+40_ULS_D1a", "STD_G+40_ULS_D1b"]
-my_combos = None
+    # =================================================================
+    # CELL 2: RUN FDR ANALYSIS
+    # =================================================================
+    print("=" * 60)
+    print("  FDR AUTOMATION TOOL — Running Analysis")
+    print("=" * 60)
 
-# %%
-# =================================================================
-# CELL 2: RUN FDR ANALYSIS
-# =================================================================
-print("=" * 60)
-print("  FDR AUTOMATION TOOL — Running Analysis")
-print("=" * 60)
+    results = tool.run_all(selected_combos=my_combos)
 
-results = tool.run_all(selected_combos=my_combos)
-
-print("\n" + "=" * 60)
-print("  ALL DONE!")
-print("=" * 60)
+    print("\n" + "=" * 60)
+    print("  ALL DONE!")
+    print("=" * 60)
