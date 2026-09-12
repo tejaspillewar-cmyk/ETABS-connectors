@@ -49,6 +49,9 @@ DEFAULT_FY = "500"
 DEFAULT_FCK = "30"
 DEFAULT_TEXT_HEIGHT = "150"
 DEFAULT_WIND_KEYWORDS = "gx, gwx, wx, wy, gy, gwy"
+DEFAULT_OFFSET_PIER = "300"
+DEFAULT_OFFSET_PT = "200"
+DEFAULT_OFFSET_AS = "200"
 ALL_STORIES = "(All stories)"
 
 WINDOW_SIZE = "1000x880"
@@ -495,6 +498,40 @@ class App(tk.Tk):
                     width=34).pack(side="left", padx=(14, 0), fill="x",
                                    expand=True)
 
+        # -- Row 1b: text stack offsets ------------------------------------
+        offsets = tk.Frame(body, bg=SURFACE)
+        offsets.pack(fill="x", pady=(12, 0))
+
+        self.var_offset_pier = tk.StringVar(value=DEFAULT_OFFSET_PIER)
+        self.var_offset_pt = tk.StringVar(value=DEFAULT_OFFSET_PT)
+        self.var_offset_as = tk.StringVar(value=DEFAULT_OFFSET_AS)
+
+        self._field(offsets, "Pier-to-text gap (mm)", self.var_offset_pier,
+                    width=8).pack(side="left")
+        self._field(offsets, "Label-to-Pt% spacing (mm)", self.var_offset_pt,
+                    width=8).pack(side="left", padx=(14, 0))
+        self._field(offsets, "Pt%-to-As spacing (mm)", self.var_offset_as,
+                    width=8).pack(side="left", padx=(14, 0))
+        tk.Label(offsets,
+                 text="Stack (bottom to top): Pier label, Required Pt%, As Required.",
+                 font=self.f_detail, fg=FG_MUTED, bg=SURFACE,
+                 wraplength=280, justify="left").pack(side="left", padx=(14, 0))
+
+        # -- Row 1c: text content options -----------------------------------
+        text_opts = tk.Frame(body, bg=SURFACE)
+        text_opts.pack(fill="x", pady=(10, 0))
+
+        self.var_show_percent = tk.BooleanVar(value=True)
+        self.var_plot_min_values = tk.BooleanVar(value=True)
+
+        self._checkbox(text_opts, "Show \"%\" symbol on Required Pt% text",
+                       self.var_show_percent).pack(side="left")
+        self._checkbox(
+            text_opts,
+            "Plot values for minimum-governed piers (blank = governed by minimum)",
+            self.var_plot_min_values
+        ).pack(side="left", padx=(20, 0))
+
         # -- Row 2: story + refresh ---------------------------------------
         row2 = tk.Frame(body, bg=SURFACE)
         row2.pack(fill="x", pady=(12, 0))
@@ -605,6 +642,13 @@ class App(tk.Tk):
                  highlightthickness=1, highlightbackground=BORDER,
                  highlightcolor=BLUE).pack(fill="x", ipady=3)
         return box
+
+    def _checkbox(self, parent, label, variable):
+        return tk.Checkbutton(
+            parent, text=label, variable=variable, font=self.f_field,
+            fg=FG, bg=SURFACE, activebackground=SURFACE, activeforeground=FG,
+            selectcolor=SURFACE2, highlightthickness=0, bd=0, cursor="hand2",
+            anchor="w")
 
     # ── Console ──────────────────────────────────────────────────────────────
 
@@ -821,6 +865,15 @@ class App(tk.Tk):
         text_h = number(self.var_text_h, "DXF text height", float, 1.0)
         if text_h is None:
             return None
+        offset_pier = number(self.var_offset_pier, "Pier-to-text gap", float, 0.0)
+        if offset_pier is None:
+            return None
+        offset_pt = number(self.var_offset_pt, "Label-to-Pt% spacing", float, 0.0)
+        if offset_pt is None:
+            return None
+        offset_as = number(self.var_offset_as, "Pt%-to-As spacing", float, 0.0)
+        if offset_as is None:
+            return None
 
         keywords = [k.strip().lower() for k in self.var_wind.get().split(",")
                     if k.strip()]
@@ -835,6 +888,9 @@ class App(tk.Tk):
         return FDRConfig(
             fy=fy, fck=fck, text_height=text_h, wind_keywords=keywords,
             story_filter=None if story == ALL_STORIES else story,
+            cad_offset_1=offset_pier, cad_offset_2=offset_pt, cad_offset_3=offset_as,
+            show_percent_symbol=self.var_show_percent.get(),
+            plot_minimum_governed_values=self.var_plot_min_values.get(),
         )
 
     def _selected_combos(self):
@@ -855,18 +911,59 @@ class App(tk.Tk):
         self._fdr_running = True
         self._disable(self._buttons["fdr_run"])
         self._set_export_enabled(False)
-        self.lbl_summary.configure(text="Running...", fg=AMBER)
+        self.lbl_summary.configure(text="Checking model...", fg=AMBER)
 
         self._log("")
         self._log("=" * 60, "info")
         self._log("  FDR ANALYSIS", "info")
         self._log("=" * 60, "info")
 
-        def job():
+        def check_job():
             from fdr_tool import FDRTool
             tool = FDRTool(model, config,
                            log=lambda m: self._post(self._write, str(m) + "\n"))
+            return tool, tool.needs_analysis()
+
+        def check_done(ok, payload, elapsed):
+            self._post(self._fdr_after_check, ok, payload, combos)
+
+        self._worker.submit(check_job, check_done)
+
+    def _fdr_after_check(self, ok, payload, combos):
+        if not ok:
+            self._fdr_done(False, payload, 0.0)
+            return
+
+        tool, needs_analysis = payload
+        if not needs_analysis:
+            self._start_fdr_pipeline(tool, combos, run_analysis_first=False)
+            return
+
+        proceed = messagebox.askyesno(
+            "Analysis required",
+            "This model has no analysis results available.\n\n"
+            "Run analysis now? The model will be saved first, and this can "
+            "take a while for large models.",
+            parent=self)
+        if not proceed:
+            self._fdr_running = False
+            self._enable(self._buttons["fdr_run"])
+            self.lbl_summary.configure(
+                text="Cancelled - run analysis in ETABS first.", fg=FG_DIM)
+            self._log("FDR cancelled: analysis required but declined.", "warn")
+            return
+
+        self.lbl_summary.configure(text="Running analysis...", fg=AMBER)
+        self._start_fdr_pipeline(tool, combos, run_analysis_first=True)
+
+    def _start_fdr_pipeline(self, tool, combos, run_analysis_first):
+        self.lbl_summary.configure(text="Running...", fg=AMBER)
+
+        def job():
+            if run_analysis_first:
+                tool.run_analysis()
             tool.extract_pier_forces(combos)
+            tool.extract_pier_coordinates()
             tool.run_calculations()
             tool.print_pt_results()
             tool.print_04fck_results()

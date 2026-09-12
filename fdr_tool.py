@@ -60,13 +60,13 @@ class FDRConfig:
     """Text height for CAD exports."""
 
     cad_offset_1: int = 300
-    """Label offset from pier center (mm)."""
+    """Gap from the pier edge to the text stack (mm)."""
 
     cad_offset_2: int = 200
-    """Value drop-down from label (mm)."""
+    """Gap from the pier label up to the Required Pt% value (mm)."""
 
     cad_offset_3: int = 200
-    """As value offset below Pt% value (mm)."""
+    """Gap from the Required Pt% value up to the As Required value (mm)."""
 
     wind_keywords: list[str] = field(
         default_factory=lambda: ['gx', 'gwx', 'wx', 'wy', 'gy', 'gwy']
@@ -75,6 +75,15 @@ class FDRConfig:
 
     story_filter: Optional[str] = None
     """Set to a story name string to filter, or None for all stories."""
+
+    show_percent_symbol: bool = True
+    """Whether Required Pt% text includes a trailing '%'."""
+
+    plot_minimum_governed_values: bool = True
+    """Whether to plot Required Pt%/As values for piers governed by the
+    code minimum (As_min). If False, those piers are left blank on the
+    CAD/DXF/Excel outputs -- the absence of a value is the drafting
+    convention for "minimum governs"."""
 
 
 # %%
@@ -175,6 +184,10 @@ def governing_case(row: pd.Series) -> str:
 # FDRTool — Main analysis engine
 # =================================================================
 
+class AnalysisRequiredError(RuntimeError):
+    """Raised when the model has no analysis results available (unlocked)."""
+
+
 class FDRTool:
     """FDR (Flexural Design Review) automation for ETABS pier walls.
 
@@ -207,9 +220,62 @@ class FDRTool:
         self._df_data: pd.DataFrame = pd.DataFrame()
         self._df_calc: pd.DataFrame = pd.DataFrame()
 
+        # Non-fatal issues collected during extraction (e.g. piers missing
+        # section properties). Surfaced by the GUI after a run.
+        self.warnings: list[str] = []
+
+        # (pier, story) -> {b, d, fck, angle, cgx, cgy}, populated by
+        # extract_pier_forces() and consumed by extract_pier_coordinates().
+        self._pier_geo: dict[tuple[str, str], dict] = {}
+
     # -----------------------------------------------------------------
     # STEP 1: Extract Pier Forces
     # -----------------------------------------------------------------
+
+    def needs_analysis(self) -> bool:
+        """Return True if the model has no analysis results available.
+
+        The model is locked by ETABS once analysis results exist. An
+        unlocked model means either analysis has never been run, or the
+        model was modified since the last run.
+        """
+        try:
+            return not self.SapModel.GetModelIsLocked()
+        except Exception:
+            return False
+
+    def run_analysis(self) -> None:
+        """Save the model (if it has a file path) and run analysis for all cases."""
+        SM = self.SapModel
+
+        try:
+            filepath = SM.GetModelFilename()
+        except Exception:
+            filepath = None
+
+        if not filepath:
+            raise RuntimeError(
+                "This model has never been saved. Save it in ETABS first, "
+                "then run FDR analysis again."
+            )
+
+        self.log("Saving model before running analysis...")
+        ret = SM.File.Save()
+        if ret != 0:
+            raise RuntimeError(f"Failed to save the model before analysis (ret={ret}).")
+
+        self.log("Running analysis - this can take a while for large models...")
+        ret = SM.Analyze.RunAnalysis()
+        if ret != 0:
+            raise RuntimeError(f"Analyze.RunAnalysis failed (ret={ret}).")
+
+        if self.needs_analysis():
+            raise RuntimeError(
+                "Analysis finished but the model is still unlocked - "
+                "results may not be available."
+            )
+
+        self.log("Analysis complete.")
 
     def get_available_combos(self) -> list[str]:
         """Return the list of response combination names defined in the model."""
@@ -240,6 +306,19 @@ class FDRTool:
 
         self.log("Extracting pier data from ETABS...")
         self.log("(Make sure your model is analyzed and results are available)")
+
+        if self.needs_analysis():
+            raise AnalysisRequiredError(
+                "This model has no analysis results available (it is unlocked). "
+                "Run analysis in ETABS, or let the FDR tool run it for you."
+            )
+
+        # Enforce kN, mm, C units to ensure calculation formulas are valid
+        try:
+            SM.SetPresentUnits(5)  # 5 = kN, mm, C
+            self.log("  Forced ETABS API units to kN, mm, C.")
+        except Exception as e:
+            self.log(f"  Warning: Could not set units to kN, mm, C. Error: {e}")
 
         SM.Results.Setup.DeselectAllCasesAndCombosForOutput()
 
@@ -304,32 +383,55 @@ class FDRTool:
         if not ok:
             raise RuntimeError(f"PierLabel.GetNameList failed (raw={ret_piers})")
 
-        pier_props = {}   # keyed by (pier_name, story_name) now, not just pier_name
+        pier_props = {}   
         for p_name in pier_label_list:
             try:
-                ret_sec = SM.PierLabel.GetSectionProperties(
-                    p_name, 0, [], [], [], [], [], [], [], [], [], [], [], [], [], [], []
-                )
+                try:
+                    ret_sec = SM.PierLabel.GetSectionProperties(p_name)
+                except:
+                    ret_sec = SM.PierLabel.GetSectionProperties(
+                        p_name, 0, [], [], [], [], [], [], [], [], [], [], [], [], [], [], []
+                    )
                 if ret_sec is not None and len(ret_sec) >= 7:
+                    # Field order per the ETABS API docs for
+                    # PierLabel.GetSectionProperties: NumberStories, StoryName,
+                    # AxisAngle, NumAreaObjs, NumLineObjs, WidthBot,
+                    # ThicknessBot, WidthTop, ThicknessTop, MatProp, CGBotX,
+                    # CGBotY, CGBotZ, CGTopX, CGTopY, CGTopZ, [returncode].
+                    # comtypes here appends the return code last rather than
+                    # first, but the leading-retcode shape is handled too in
+                    # case that ever differs.
                     if ret_sec[0] == 0 and isinstance(ret_sec[1], int):
                         num_stories_for_pier = ret_sec[1]
                         story_name_arr = ret_sec[2]
+                        angle_arr = ret_sec[3]
                         width_bot_arr = ret_sec[6]
                         thick_bot_arr = ret_sec[7]
+                        cgx_arr = ret_sec[11]
+                        cgy_arr = ret_sec[12]
                     else:
                         num_stories_for_pier = ret_sec[0]
                         story_name_arr = ret_sec[1]
+                        angle_arr = ret_sec[2]
                         width_bot_arr = ret_sec[5]
                         thick_bot_arr = ret_sec[6]
+                        cgx_arr = ret_sec[10]
+                        cgy_arr = ret_sec[11]
                     for s_idx in range(num_stories_for_pier):
-                        story_nm = str(story_name_arr[s_idx]).strip()
-                        pier_props[(p_name, story_nm)] = {
+                        story_nm = str(story_name_arr[s_idx]).strip().upper()
+                        pier_key = str(p_name).strip().upper()
+                        pier_props[(pier_key, story_nm)] = {
                             'b': float(thick_bot_arr[s_idx]),
                             'd': float(width_bot_arr[s_idx]),
                             'fck': cfg.fck,
+                            'angle': float(angle_arr[s_idx]),
+                            'cgx': float(cgx_arr[s_idx]),
+                            'cgy': float(cgy_arr[s_idx]),
                         }
             except Exception as e:
-                self.log(f"  Warning: Could not get section for pier {p_name}: {e}")
+                msg = f"Could not get section for pier {p_name}: {e}"
+                self.log(f"  Warning: {msg}")
+                self.warnings.append(msg)
 
         # --- Build raw data DataFrame (bottom-location rows only) ---
         raw_rows = []
@@ -352,7 +454,12 @@ class FDRTool:
         grouped_data = []
 
         for (story, pier_id), group in self._df_raw.groupby(['Story', 'Pier_ID']):
-            props = pier_props.get((pier_id, story), {'b': 0, 'd': 0, 'fck': cfg.fck})
+            s_key = str(story).strip().upper()
+            p_key = str(pier_id).strip().upper()
+            props = pier_props.get(
+                (p_key, s_key),
+                {'b': 0, 'd': 0, 'fck': cfg.fck, 'angle': 0.0, 'cgx': 0.0, 'cgy': 0.0},
+            )
             sorted_g = group.sort_values('P')
 
             min_row = sorted_g.iloc[0]
@@ -387,6 +494,7 @@ class FDRTool:
             })
 
         self._df_data = pd.DataFrame(grouped_data)
+        self._pier_geo = pier_props  # (pier, story) -> b/d/angle/cgx/cgy, reused by extract_pier_coordinates
 
         # Natural sort by Pier_ID
         self._df_data['_sort_key'] = self._df_data['Pier_ID'].apply(natural_sort_key)
@@ -411,82 +519,53 @@ class FDRTool:
     # -----------------------------------------------------------------
 
     def extract_pier_coordinates(self) -> pd.DataFrame:
-        SM = self.SapModel
-        self.log("Extracting pier coordinates...")
+        """Compute each pier's centerline endpoints analytically.
 
-        # --- Build a reverse lookup: pier name -> list of area object names ---
-        ret_areas = SM.AreaObj.GetNameList(0, [])
-        ok, n, all_area_names = parse_namelist(ret_areas)
-        if not ok:
-            raise RuntimeError(f"AreaObj.GetNameList failed (raw={ret_areas})")
+        PierLabel.GetSectionProperties already returns each pier's center of
+        gravity (CGBotX/CGBotY) and local axis angle per story -- the pier's
+        own authoritative geometry. The centerline endpoints are just that
+        CG point offset by half the design width along the axis direction.
 
-        pier_to_areas: dict[str, list[str]] = {}
-        for area_name in all_area_names:
-            try:
-                ret_pl = SM.AreaObj.GetPier(area_name, "")   # confirm exact signature before trusting - see note below
-                pier_label = None
-                if isinstance(ret_pl, (list, tuple)):
-                    if len(ret_pl) >= 2 and ret_pl[0] == 0:
-                        pier_label = ret_pl[1]
-                    else:
-                        for item in ret_pl:
-                            if isinstance(item, str) and item.strip():
-                                pier_label = item.strip()
-                                break
-                elif isinstance(ret_pl, str):
-                    pier_label = ret_pl
-                    
-                if pier_label:
-                        pier_to_areas.setdefault(pier_label, []).append(area_name)
-            except Exception:
-                pass
+        This used to be reverse-engineered from AreaObj/PointObj corner data
+        instead, which was unreliable two ways: (1) a pier label's areas
+        were matched globally rather than per story, so every story but one
+        got another story's geometry; (2) even for a single story, the
+        matched area's raw corner extents didn't necessarily match the
+        pier's own reported design width -- e.g. one pier's corners spanned
+        exactly one story height (3000mm) when its actual design width was
+        833mm, because the matched area was a meshed panel, not the pier
+        section itself. Deriving the endpoints from the pier's own CG+angle+
+        width sidesteps both problems and needs no extra ETABS calls, since
+        extract_pier_forces() already fetched this data.
+        """
+        self.log("Computing pier coordinates from section properties...")
 
-        for idx, row in self._df_data.iterrows():
-            pier_id = row['Pier_ID']
-            try:
-                area_names = pier_to_areas.get(pier_id, [])
-                if len(area_names) > 0:
-                    ret_pts = SM.AreaObj.GetPoints(area_names[0], 0, [])
-                    ok, n_pts, point_names = parse_namelist(ret_pts)
-                    if ok:
-                        xs, ys = [], []
-                        for pt_name in point_names:
-                            ret_coord = SM.PointObj.GetCoordCartesian(pt_name, 0.0, 0.0, 0.0)
-                            if isinstance(ret_coord, (list, tuple)) and len(ret_coord) >= 3:
-                                if ret_coord[0] == 0:
-                                    xs.append(float(ret_coord[1]))
-                                    ys.append(float(ret_coord[2]))
-                                else:
-                                    xs.append(float(ret_coord[0]))
-                                    ys.append(float(ret_coord[1]))
-                        if len(xs) >= 2:
-                            x_min, x_max = min(xs), max(xs)
-                            y_min, y_max = min(ys), max(ys)
-                            dx = x_max - x_min
-                            dy = y_max - y_min
-                            if dx >= dy:
-                                mid_y = (y_min + y_max) / 2
-                                self._df_data.at[idx, 'x1'] = x_min
-                                self._df_data.at[idx, 'y1'] = mid_y
-                                self._df_data.at[idx, 'x2'] = x_max
-                                self._df_data.at[idx, 'y2'] = mid_y
-                            else:
-                                mid_x = (x_min + x_max) / 2
-                                self._df_data.at[idx, 'x1'] = mid_x
-                                self._df_data.at[idx, 'y1'] = y_min
-                                self._df_data.at[idx, 'x2'] = mid_x
-                                self._df_data.at[idx, 'y2'] = y_max
-            except Exception:
-                pass
+        df = self._df_data
+        missing = 0
+        for idx, row in df.iterrows():
+            key = (str(row['Pier_ID']).strip().upper(), str(row['Story']).strip().upper())
+            props = self._pier_geo.get(key)
+            if props is None:
+                missing += 1
+                continue
 
-        coords_found = (
-            (self._df_data['x1'] != 0) | (self._df_data['y1'] != 0)
-        ).sum()
-        self.log(f"Coordinates extracted for {coords_found}/{len(self._df_data)} piers.")
-        if coords_found < len(self._df_data):
-            self.log("  Piers without coordinates will be skipped in CAD export.")
+            angle_rad = math.radians(props['angle'])
+            half_len = row['d'] / 2
+            dx = half_len * math.cos(angle_rad)
+            dy = half_len * math.sin(angle_rad)
 
-        return self._df_data.copy()
+            df.at[idx, 'x1'] = props['cgx'] - dx
+            df.at[idx, 'y1'] = props['cgy'] - dy
+            df.at[idx, 'x2'] = props['cgx'] + dx
+            df.at[idx, 'y2'] = props['cgy'] + dy
+
+        coords_found = ((df['x1'] != 0) | (df['y1'] != 0)).sum()
+        self.log(f"Coordinates computed for {coords_found}/{len(df)} piers.")
+        if missing:
+            self.log(f"  {missing} pier(s) had no matching section properties "
+                  "and will be skipped in CAD export.")
+
+        return df.copy()
 
     # -----------------------------------------------------------------
     # STEP 3: Run All Structural Calculations
@@ -583,7 +662,7 @@ class FDRTool:
         return self._df_calc.copy()
 
     def _place_cad_labels(self, df: pd.DataFrame) -> None:
-        """Compute label positions for CAD export using uniform spacing."""
+        """Compute label positions for CAD export using uniform spacing and collision avoidance."""
         cfg = self.config
         
         # We will use cad_offset_1 as the gap from the pier edge to the text center.
@@ -609,9 +688,6 @@ class FDRTool:
         
         CHAR_W = 70
         TEXT_H = cfg.text_height
-        # Text block is 4 lines (Label, Value, CD_04, CD_02, AsValue). 
-        # Actually in export_cad, it exports 5 items, but typically spaced by cad_offset_2 and cad_offset_3.
-        # It's roughly offset_2 down, then offset_3 down.
 
         for idx, row in df.iterrows():
             x1, y1, x2, y2, b = row['x1'], row['y1'], row['x2'], row['y2'], row['b']
@@ -631,32 +707,34 @@ class FDRTool:
             
             # Try to place text block 
             if is_horiz:
-                # Primary: Below
+                # Primary: Above -> Below -> Right -> Left
                 candidates = [
-                    (mid_x, mid_y - edge_y - gap),
                     (mid_x, mid_y + edge_y + gap),
+                    (mid_x, mid_y - edge_y - gap),
                     (mid_x + edge_x + gap, mid_y),
                     (mid_x - edge_x - gap, mid_y),
                 ]
             else:
-                # Primary: Right
+                # Primary: Right -> Left -> Above -> Below
                 candidates = [
                     (mid_x + edge_x + gap, mid_y),
                     (mid_x - edge_x - gap, mid_y),
-                    (mid_x, mid_y - edge_y - gap),
                     (mid_x, mid_y + edge_y + gap),
+                    (mid_x, mid_y - edge_y - gap),
                 ]
                 
             max_text_len = max(len(str(row['Pier_ID'])), 6)
             text_half_w = (max_text_len * CHAR_W) / 2
             
             def make_label_box(lx, ly):
-                # Total block goes from ly down to ly - (cfg.cad_offset_2 + cfg.cad_offset_3)
+                # Stack grows upward from the pier label: PierLabel at ly,
+                # RequiredPt above it, RequiredAs above that.
+                top_y = ly + cfg.cad_offset_2 + cfg.cad_offset_3
                 return {
                     'xMin': lx - text_half_w,
                     'xMax': lx + text_half_w,
-                    'yMin': min(ly, ly - cfg.cad_offset_2 - cfg.cad_offset_3) - TEXT_H / 2,
-                    'yMax': max(ly, ly - cfg.cad_offset_2 - cfg.cad_offset_3) + TEXT_H / 2,
+                    'yMin': min(ly, top_y) - TEXT_H / 2,
+                    'yMax': max(ly, top_y) + TEXT_H / 2,
                 }
                 
             label_x, label_y = candidates[0]
@@ -678,9 +756,9 @@ class FDRTool:
             df.at[idx, 'labelX'] = label_x
             df.at[idx, 'labelY'] = label_y
             df.at[idx, 'valueX'] = label_x
-            df.at[idx, 'valueY'] = label_y - cfg.cad_offset_2
+            df.at[idx, 'valueY'] = label_y + cfg.cad_offset_2
             df.at[idx, 'asValueX'] = label_x
-            df.at[idx, 'asValueY'] = label_y - cfg.cad_offset_2 - cfg.cad_offset_3
+            df.at[idx, 'asValueY'] = label_y + cfg.cad_offset_2 + cfg.cad_offset_3
 
     # -----------------------------------------------------------------
     # Summary
@@ -692,12 +770,13 @@ class FDRTool:
         Returns
         -------
         dict
-            Keys: total_piers, max_pt, inadequate_04, ductile_reqd,
-            tension_count, compression_count, minimum_count.
+            Keys: total_piers, stories, max_pt, inadequate_04, ductile_reqd,
+            tension_count, compression_count, minimum_count, no_compression.
         """
         df = self._df_calc
         return {
             'total_piers': len(df),
+            'stories': int(df['Story'].nunique()) if len(df) > 0 else 0,
             'max_pt': df['Pt_percent'].max() if len(df) > 0 else 0.0,
             'inadequate_04': int((df['Status_04'] == 'Inadequate').sum()),
             'ductile_reqd': int(
@@ -706,6 +785,7 @@ class FDRTool:
             'tension_count': int((df['Governing'] == 'Tension').sum()),
             'compression_count': int((df['Governing'] == 'Compression').sum()),
             'minimum_count': int((df['Governing'] == 'Minimum').sum()),
+            'no_compression': int((df['Pmin'] >= 0).sum()) if len(df) > 0 else 0,
         }
 
     # -----------------------------------------------------------------
@@ -816,6 +896,29 @@ class FDRTool:
             self.log(duct.to_string(index=False))
 
     # -----------------------------------------------------------------
+    # Shared label text formatting (used by export_cad/export_excel/export_dxf)
+    # -----------------------------------------------------------------
+
+    def _pt_label(self, row) -> str | None:
+        """Formatted Required Pt% text for one row, or None to plot nothing."""
+        cfg = self.config
+        if row['Governing'] == 'Minimum' and not cfg.plot_minimum_governed_values:
+            return None
+        is_comp = row['As_max'] == row['Asc'] and row['Asc'] > 0
+        suffix = '%' if cfg.show_percent_symbol else ''
+        value = f"{row['Pt_percent']:.2f}{suffix}"
+        return f"({value})" if is_comp else value
+
+    def _as_label(self, row) -> str | None:
+        """Formatted As Required text for one row, or None to plot nothing."""
+        cfg = self.config
+        if row['Governing'] == 'Minimum' and not cfg.plot_minimum_governed_values:
+            return None
+        is_comp = row['As_max'] == row['Asc'] and row['Asc'] > 0
+        value = f"{row['As_max']:.0f}"
+        return f"({value})" if is_comp else value
+
+    # -----------------------------------------------------------------
     # EXPORT: CAD Scripts
     # -----------------------------------------------------------------
 
@@ -840,12 +943,25 @@ class FDRTool:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
         df = self._df_calc
         generated_files = []
+        TEXT_H = self.config.text_height
 
-        def _save(name, rows):
+        # Creates (or redefines) a "Calibri" text style and makes it current,
+        # so the plain "-text" lines below -- which don't specify a style --
+        # pick it up instead of inheriting whatever style happens to already
+        # be current in the drawing they're pasted into. Field order follows
+        # the "-STYLE" command prompts: name, font, height, width factor,
+        # obliquing angle, backwards?, upside-down?, vertical? (blank = keep
+        # that prompt's default).
+        style_setup = "-style\t" + "\t".join(
+            ["Calibri", "calibri.ttf", "", "", "", "", "", ""]
+        )
+
+        def _save(name, rows, set_style=False):
             filename = f"FDR_{name}_{timestamp}.scr"
             filepath = os.path.join(output_dir, filename)
+            out_rows = ([style_setup] + rows) if set_style else rows
             with open(filepath, 'w') as f:
-                f.write('\n'.join(rows))
+                f.write('\n'.join(out_rows))
             self.log(f"  {name}: {len(rows)} rows -> {filename}")
             generated_files.append(filepath)
             return filepath
@@ -856,7 +972,7 @@ class FDRTool:
             if 'labelX' not in r or pd.isna(r.get('labelX', None)):
                 continue
             label_rows.append(
-                f"-text\t{r['labelX']:.1f},{r['labelY']:.1f}\t100\t0\t"
+                f"-text\t{r['labelX']:.1f},{r['labelY']:.1f}\t{TEXT_H}\t0\t"
                 f"{r['Pier_ID']}"
             )
 
@@ -865,31 +981,31 @@ class FDRTool:
         for _, r in df.iterrows():
             if 'valueX' not in r or pd.isna(r.get('valueX', None)):
                 continue
-            is_comp = r['As_max'] == r['Asc'] and r['Asc'] > 0
-            pt_label = (f"({r['Pt_percent']:.2f}%)" if is_comp
-                        else f"{r['Pt_percent']:.2f}%")
+            pt_label = self._pt_label(r)
+            if pt_label is None:
+                continue
             pt_rows.append(
-                f"-text\t{r['valueX']:.1f},{r['valueY']:.1f}\t100\t0\t"
+                f"-text\t{r['valueX']:.1f},{r['valueY']:.1f}\t{TEXT_H}\t0\t"
                 f"{pt_label}"
             )
 
         # --- 0.4 fck C/D ---
         cd04_rows = []
         for _, r in df.iterrows():
-            if 'valueX' not in r or pd.isna(r.get('valueX', None)):
+            if 'labelX' not in r or pd.isna(r.get('labelX', None)):
                 continue
             cd04_rows.append(
-                f"-text\t{r['valueX']:.1f},{r['valueY']:.1f}\t100\t0\t"
+                f"-text\t{r['labelX']:.1f},{r['labelY']:.1f}\t{TEXT_H}\t0\t"
                 f"{r['CD_Ratio_04']:.2f}"
             )
 
         # --- 0.2 fck C/D ---
         cd02_rows = []
         for _, r in df.iterrows():
-            if 'valueX' not in r or pd.isna(r.get('valueX', None)):
+            if 'labelX' not in r or pd.isna(r.get('labelX', None)):
                 continue
             cd02_rows.append(
-                f"-text\t{r['valueX']:.1f},{r['valueY']:.1f}\t100\t0\t"
+                f"-text\t{r['labelX']:.1f},{r['labelY']:.1f}\t{TEXT_H}\t0\t"
                 f"{r['CD_Ratio_02']:.2f}"
             )
 
@@ -898,11 +1014,11 @@ class FDRTool:
         for _, r in df.iterrows():
             if 'asValueX' not in r or pd.isna(r.get('asValueX', None)):
                 continue
-            is_comp = r['As_max'] == r['Asc'] and r['Asc'] > 0
-            as_label = (f"({r['As_max']:.0f})" if is_comp
-                        else f"{r['As_max']:.0f}")
+            as_label = self._as_label(r)
+            if as_label is None:
+                continue
             as_rows.append(
-                f"-text\t{r['asValueX']:.1f},{r['asValueY']:.1f}\t100\t0\t"
+                f"-text\t{r['asValueX']:.1f},{r['asValueY']:.1f}\t{TEXT_H}\t0\t"
                 f"{as_label}"
             )
 
@@ -931,11 +1047,11 @@ class FDRTool:
         self.log(f"  CAD EXPORT -- saved to: {output_dir}")
         self.log(f"{'='*60}")
 
-        _save("PierLabels", label_rows)
-        _save("RequiredPt", pt_rows)
-        _save("CD_04fck", cd04_rows)
-        _save("CD_02fck", cd02_rows)
-        _save("As_Required", as_rows)
+        _save("PierLabels", label_rows, set_style=True)
+        _save("RequiredPt", pt_rows, set_style=True)
+        _save("CD_04fck", cd04_rows, set_style=True)
+        _save("CD_02fck", cd02_rows, set_style=True)
+        _save("As_Required", as_rows, set_style=True)
         _save("PierRectangles", rect_rows)
 
         if skipped_piers:
@@ -1013,8 +1129,16 @@ class FDRTool:
         ]
         export_cols = [c for c in export_cols if c in df.columns]
 
-        # Prepare AutoCAD Commands data
-        cad_rows = []
+        # Prepare separate AutoCAD Commands dataframes
+        cad_rect_rows = []
+        cad_label_rows = []
+        cad_pt_rows = []
+        cad_as_rows = []
+        cad_04_rows = []
+        cad_02_rows = []
+        
+        TEXT_H = self.config.text_height
+
         if not df.empty:
             for _, r in df.iterrows():
                 # Rectangle
@@ -1023,74 +1147,161 @@ class FDRTool:
                     corners = compute_pier_corners(x1, y1, x2, y2, b)
                     if corners is not None:
                         c1, c2, c3, c4 = corners
-                        cad_rows.append({'Pier_ID': r['Pier_ID'], 'Type': 'Rectangle', 
-                                        'Command': f"PLINE {c1[0]:.1f},{c1[1]:.1f} {c2[0]:.1f},{c2[1]:.1f} {c3[0]:.1f},{c3[1]:.1f} {c4[0]:.1f},{c4[1]:.1f} C"})
+                        cad_rect_rows.append({
+                            'Pier_ID': r['Pier_ID'], 'Command': 'PLINE',
+                            'Point1': f"{c1[0]:.1f},{c1[1]:.1f}",
+                            'Point2': f"{c2[0]:.1f},{c2[1]:.1f}",
+                            'Point3': f"{c3[0]:.1f},{c3[1]:.1f}",
+                            'Point4': f"{c4[0]:.1f},{c4[1]:.1f}",
+                            'Close': 'C',
+                        })
+
                 # Label
                 if 'labelX' in r and not pd.isna(r['labelX']):
-                    cad_rows.append({'Pier_ID': r['Pier_ID'], 'Type': 'Label', 
-                                    'Command': f"-text\t{r['labelX']:.1f},{r['labelY']:.1f}\t100\t0\t{r['Pier_ID']}"})
+                    label_xy = f"{r['labelX']:.1f},{r['labelY']:.1f}"
+                    cad_label_rows.append({
+                        'Pier_ID': r['Pier_ID'], 'Command': '-text',
+                        'Point': label_xy,
+                        'Height': TEXT_H, 'Rotation': 0, 'Text': r['Pier_ID'],
+                    })
+
+                    # 0.4fck and 0.2fck use the base label coordinate because they go on separate drawings
+                    cad_04_rows.append({
+                        'Pier_ID': r['Pier_ID'], 'Command': '-text',
+                        'Point': label_xy,
+                        'Height': TEXT_H, 'Rotation': 0,
+                        'Text': round(r['CD_Ratio_04'], 2),
+                    })
+                    cad_02_rows.append({
+                        'Pier_ID': r['Pier_ID'], 'Command': '-text',
+                        'Point': label_xy,
+                        'Height': TEXT_H, 'Rotation': 0,
+                        'Text': round(r['CD_Ratio_02'], 2),
+                    })
+
                 # Required Pt%
                 if 'valueX' in r and not pd.isna(r['valueX']):
-                    is_comp = r.get('As_max', 0) == r.get('Asc', -1) and r.get('Asc', 0) > 0
-                    pt_label = f"({r['Pt_percent']:.2f}%)" if is_comp else f"{r['Pt_percent']:.2f}%"
-                    cad_rows.append({'Pier_ID': r['Pier_ID'], 'Type': 'Required Pt%', 
-                                    'Command': f"-text\t{r['valueX']:.1f},{r['valueY']:.1f}\t100\t0\t{pt_label}"})
+                    pt_label = self._pt_label(r)
+                    if pt_label is not None:
+                        cad_pt_rows.append({
+                            'Pier_ID': r['Pier_ID'], 'Command': '-text',
+                            'Point': f"{r['valueX']:.1f},{r['valueY']:.1f}",
+                            'Height': TEXT_H, 'Rotation': 0, 'Text': pt_label,
+                        })
+
                 # As Required
                 if 'asValueX' in r and not pd.isna(r['asValueX']):
-                    is_comp = r.get('As_max', 0) == r.get('Asc', -1) and r.get('Asc', 0) > 0
-                    as_label = f"({r['As_max']:.0f})" if is_comp else f"{r['As_max']:.0f}"
-                    cad_rows.append({'Pier_ID': r['Pier_ID'], 'Type': 'As Required', 
-                                    'Command': f"-text\t{r['asValueX']:.1f},{r['asValueY']:.1f}\t100\t0\t{as_label}"})
+                    as_label = self._as_label(r)
+                    if as_label is not None:
+                        cad_as_rows.append({
+                            'Pier_ID': r['Pier_ID'], 'Command': '-text',
+                            'Point': f"{r['asValueX']:.1f},{r['asValueY']:.1f}",
+                            'Height': TEXT_H, 'Rotation': 0, 'Text': as_label,
+                        })
 
-        df_cad = pd.DataFrame(cad_rows)
+        df_cad_rect = pd.DataFrame(cad_rect_rows)
+        df_cad_label = pd.DataFrame(cad_label_rows)
+        df_cad_pt = pd.DataFrame(cad_pt_rows)
+        df_cad_as = pd.DataFrame(cad_as_rows)
+        df_cad_04 = pd.DataFrame(cad_04_rows)
+        df_cad_02 = pd.DataFrame(cad_02_rows)
+
+        # Mapping for unit-aware headers
+        rename_map = {
+            'b': 'b (mm)',
+            'd': 'd (mm)',
+            'fck': 'fck (MPa)',
+            'x1': 'x1 (mm)', 'y1': 'y1 (mm)', 'x2': 'x2 (mm)', 'y2': 'y2 (mm)',
+            'Pmin': 'Pmin (kN)', 'Pmax': 'Pmax (kN)',
+            'Pmin_NoWind': 'Pmin_NoWind (kN)', 'Pmax_NoWind': 'Pmax_NoWind (kN)',
+            'As_min': 'As_min (mm2)', 'Asc': 'Asc (mm2)', 'Ast': 'Ast (mm2)', 'As_max': 'As_max (mm2)',
+            'Pu_capacity_04': 'Pu_capacity_04 (kN)', 'Demand_04': 'Demand_04 (kN)',
+            'Pu_02fck': 'Pu_02fck (kN)', 'Demand_02': 'Demand_02 (kN)',
+        }
+        
+        df_export = df.rename(columns=rename_map)
+        export_cols_full = [rename_map.get(c, c) for c in export_cols if c in df.columns]
 
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            df[export_cols].to_excel(writer, sheet_name='Full Analysis', index=False)
-            df[['Story', 'Pier_ID', 'b', 'd', 'fck',
-                'Pmin', 'Combo_Pmin', 'Pmax', 'Combo_Pmax',
-                'As_min', 'Asc', 'Ast', 'As_max',
-                'Pt_percent', 'Governing']].to_excel(writer, sheet_name='Required Pt', index=False)
-            df[['Story', 'Pier_ID', 'Pu_capacity_04', 'Demand_04',
-                'Combo_Pmin_NoWind', 'CD_Ratio_04', 'Status_04']].to_excel(writer, sheet_name='0.4fck CD Check', index=False)
-            df[['Story', 'Pier_ID', 'Demand_02', 'Combo_Pmin_NoWind',
-                'Pu_02fck', 'CD_Ratio_02',
-                'Ductile_Detailing_Reqd']].to_excel(writer, sheet_name='0.2fck Boundary', index=False)
-            if not df_cad.empty:
-                df_cad.to_excel(writer, sheet_name='AutoCAD Commands', index=False)
-            if len(self._df_raw) > 0:
-                self._df_raw.to_excel(writer, sheet_name='Raw Envelope', index=False)
+            df_export[export_cols_full].to_excel(writer, sheet_name='Full Analysis', index=False)
+            
+            pt_cols = [rename_map.get(c, c) for c in ['Story', 'Pier_ID', 'b', 'd', 'fck', 'Pmin', 'Combo_Pmin', 'Pmax', 'Combo_Pmax', 'As_min', 'Asc', 'Ast', 'As_max', 'Pt_percent', 'Governing']]
+            df_export[pt_cols].to_excel(writer, sheet_name='Required Pt', index=False)
+            
+            cd04_cols = [rename_map.get(c, c) for c in ['Story', 'Pier_ID', 'Pu_capacity_04', 'Demand_04', 'Combo_Pmin_NoWind', 'CD_Ratio_04', 'Status_04']]
+            df_export[cd04_cols].to_excel(writer, sheet_name='0.4fck CD Check', index=False)
+            
+            cd02_cols = [rename_map.get(c, c) for c in ['Story', 'Pier_ID', 'Demand_02', 'Combo_Pmin_NoWind', 'Pu_02fck', 'CD_Ratio_02', 'Ductile_Detailing_Reqd']]
+            df_export[cd02_cols].to_excel(writer, sheet_name='0.2fck Boundary', index=False)
+            
+            if not df_cad_rect.empty: df_cad_rect.to_excel(writer, sheet_name='CAD - Pier Rectangles', index=False)
+            if not df_cad_label.empty: df_cad_label.to_excel(writer, sheet_name='CAD - Pier Labels', index=False)
+            if not df_cad_pt.empty: df_cad_pt.to_excel(writer, sheet_name='CAD - Required Pt', index=False)
+            if not df_cad_as.empty: df_cad_as.to_excel(writer, sheet_name='CAD - As Required', index=False)
+            if not df_cad_04.empty: df_cad_04.to_excel(writer, sheet_name='CAD - 0.4fck CD', index=False)
+            if not df_cad_02.empty: df_cad_02.to_excel(writer, sheet_name='CAD - 0.2fck CD', index=False)
 
-            # Apply Formatting
+            # Apply formatting. Bounded regardless of sheet size so a large
+            # model can never turn this into a multi-minute, file-corrupting
+            # write (this used to also embed the raw per-combo envelope here
+            # -- hundreds of thousands of rows -- which is why it's now a
+            # separate CSV instead, see below).
             workbook = writer.book
             thin_border = Border(left=Side(style='thin'), right=Side(style='thin'),
                                  top=Side(style='thin'), bottom=Side(style='thin'))
             header_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
             header_font = Font(bold=True)
 
+            BORDER_ROW_LIMIT = 20000    # skip per-cell borders past this many rows
+            WIDTH_SAMPLE_ROWS = 200     # column width only needs a sample
+
             for sheet_name in workbook.sheetnames:
                 ws = workbook[sheet_name]
-                for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
-                    for cell in row:
+                apply_borders = ws.max_row <= BORDER_ROW_LIMIT
+
+                for col_idx in range(1, ws.max_column + 1):
+                    cell = ws.cell(row=1, column=col_idx)
+                    cell.fill = header_fill
+                    cell.font = header_font
+                    if apply_borders:
                         cell.border = thin_border
-                        if cell.row == 1:
-                            cell.fill = header_fill
-                            cell.font = header_font
-                
-                # Auto-adjust column widths based on the length of column headers
-                for col in ws.columns:
+
+                if apply_borders and ws.max_row > 1:
+                    for row in ws.iter_rows(min_row=2, max_row=ws.max_row,
+                                            min_col=1, max_col=ws.max_column):
+                        for cell in row:
+                            cell.border = thin_border
+                else:
+                    self.log(f"  ({sheet_name}: {ws.max_row} rows -- skipped "
+                          f"cell borders to keep export fast)")
+
+                # Auto-adjust column widths from a bounded sample of rows
+                sample_limit = min(ws.max_row, WIDTH_SAMPLE_ROWS)
+                for col in ws.iter_cols(min_row=1, max_row=sample_limit,
+                                       max_col=ws.max_column):
                     max_length = 0
                     column = col[0].column_letter
                     for cell in col:
                         try:
                             if len(str(cell.value)) > max_length:
                                 max_length = len(str(cell.value))
-                        except:
+                        except Exception:
                             pass
-                    adjusted_width = (max_length + 2)
-                    ws.column_dimensions[column].width = adjusted_width
+                    ws.column_dimensions[column].width = max_length + 2
 
         self.log(f"Excel report saved: {output_path}")
-        self.log("  Sheets: Full Analysis | Required Pt | 0.4fck CD Check | 0.2fck Boundary | AutoCAD Commands | Raw Envelope")
+        self.log("  Sheets: Full Analysis | Required Pt | 0.4fck CD Check | 0.2fck Boundary | CAD sheets")
+
+        # Raw per-combo envelope (one row per pier/story/combo, can be huge
+        # for a real model -- hundreds of thousands of rows). Writing this
+        # into the xlsx via openpyxl used to make the file enormous and slow
+        # enough to write that it could come out corrupt. A CSV handles the
+        # same volume in a couple of seconds.
+        if len(self._df_raw) > 0:
+            raw_csv_path = os.path.splitext(output_path)[0] + "_RawEnvelope.csv"
+            raw_export = self._df_raw.rename(columns={'P': 'P (kN)'})
+            raw_export.to_csv(raw_csv_path, index=False)
+            self.log(f"  Raw envelope ({len(raw_export)} rows) saved separately: {raw_csv_path}")
 
         return output_path
 
@@ -1156,7 +1367,9 @@ class FDRTool:
         doc.layers.add(name="PierLabels", color=ezdxf.colors.YELLOW)
         doc.layers.add(name="RequiredPt", color=ezdxf.colors.CYAN)
         doc.layers.add(name="AsRequired", color=ezdxf.colors.MAGENTA)
-        
+
+        doc.styles.add("Calibri", font="calibri.ttf")
+
         TEXT_H = self.config.text_height
 
         for _, r in df.iterrows():
@@ -1170,25 +1383,25 @@ class FDRTool:
 
             # Label
             if 'labelX' in r and not pd.isna(r['labelX']):
-                msp.add_text(str(r['Pier_ID']), dxfattribs={'layer': 'PierLabels', 'height': TEXT_H}).set_placement(
+                msp.add_text(str(r['Pier_ID']), dxfattribs={'layer': 'PierLabels', 'height': TEXT_H, 'style': 'Calibri'}).set_placement(
                     (r['labelX'], r['labelY']), align=ezdxf.enums.TextEntityAlignment.CENTER
                 )
 
             # Required Pt%
             if 'valueX' in r and not pd.isna(r['valueX']):
-                is_comp = r.get('As_max', 0) == r.get('Asc', -1) and r.get('Asc', 0) > 0
-                pt_label = f"({r['Pt_percent']:.2f}%)" if is_comp else f"{r['Pt_percent']:.2f}%"
-                msp.add_text(pt_label, dxfattribs={'layer': 'RequiredPt', 'height': TEXT_H}).set_placement(
-                    (r['valueX'], r['valueY']), align=ezdxf.enums.TextEntityAlignment.CENTER
-                )
+                pt_label = self._pt_label(r)
+                if pt_label is not None:
+                    msp.add_text(pt_label, dxfattribs={'layer': 'RequiredPt', 'height': TEXT_H, 'style': 'Calibri'}).set_placement(
+                        (r['valueX'], r['valueY']), align=ezdxf.enums.TextEntityAlignment.CENTER
+                    )
 
             # As Required
             if 'asValueX' in r and not pd.isna(r['asValueX']):
-                is_comp = r.get('As_max', 0) == r.get('Asc', -1) and r.get('Asc', 0) > 0
-                as_label = f"({r['As_max']:.0f})" if is_comp else f"{r['As_max']:.0f}"
-                msp.add_text(as_label, dxfattribs={'layer': 'AsRequired', 'height': TEXT_H}).set_placement(
-                    (r['asValueX'], r['asValueY']), align=ezdxf.enums.TextEntityAlignment.CENTER
-                )
+                as_label = self._as_label(r)
+                if as_label is not None:
+                    msp.add_text(as_label, dxfattribs={'layer': 'AsRequired', 'height': TEXT_H, 'style': 'Calibri'}).set_placement(
+                        (r['asValueX'], r['asValueY']), align=ezdxf.enums.TextEntityAlignment.CENTER
+                    )
 
         doc.saveas(filepath)
         self.log(f"DXF saved: {filepath}")
