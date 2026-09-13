@@ -168,8 +168,11 @@ INVENTORY_CODE = (
     "print(f'Nodes  (Points) : {SapModel.PointObj.Count()}')\n"
     "print(f'Frames (Members): {SapModel.FrameObj.Count()}')\n"
     "print(f'Areas  (Shells) : {SapModel.AreaObj.Count()}')\n"
-    "ret = SapModel.PierLabel.GetNameList(0, [])\n"
-    "print(f'Pier labels     : {ret[1] if ret and ret[0] == 0 else 0}')"
+    # GetNameList comes back as (count, names, ret) on some builds and
+    # (ret, count, names) on others -- reuse the parser that already knows.
+    "from fdr_tool import parse_namelist\n"
+    "_ok, _count, _ = parse_namelist(SapModel.PierLabel.GetNameList(0, []))\n"
+    "print(f'Pier labels     : {_count if _ok else \"could not read\"}')"
 )
 
 CELLS = [
