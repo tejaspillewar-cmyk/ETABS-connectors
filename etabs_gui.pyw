@@ -335,6 +335,63 @@ class ChooseInstance(tk.Toplevel):
         self.destroy()
 
 
+class ChooseMode(tk.Toplevel):
+    """Renumber everything, or only repair the labels that clash."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.result = None
+        self.title("Relabel piers")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.transient(parent)
+
+        tk.Label(self, text="How should the piers be relabelled?",
+                 font=parent.f_title, bg=BG, fg=FG).pack(
+            anchor="w", padx=18, pady=(16, 10))
+
+        for title, detail, mode in (
+                ("Renumber all piers",
+                 "Every stack is numbered P1..Pn by plan position. Gives a "
+                 "clean, predictable scheme, but most labels change.", "all"),
+                ("Fix clashes only",
+                 "Keeps a label where it already names exactly one pier, and "
+                 "renames only the ones that clash. Smallest change.", "fix")):
+            box = tk.Frame(self, bg=SURFACE2, padx=12, pady=10)
+            box.pack(fill="x", padx=18, pady=(0, 8))
+            tk.Label(box, text=title, font=parent.f_btn, bg=SURFACE2,
+                     fg=FG, anchor="w").pack(fill="x")
+            tk.Label(box, text=detail, font=parent.f_detail, bg=SURFACE2,
+                     fg=FG_DIM, anchor="w", justify="left",
+                     wraplength=360).pack(fill="x", pady=(2, 6))
+            tk.Button(box, text="Choose", font=parent.f_btn, bg=BLUE, fg=BG,
+                      activebackground=BLUE_H, activeforeground=BG, bd=0,
+                      relief="flat", padx=12, pady=3, cursor="hand2",
+                      command=lambda m=mode: self._pick(m)).pack(anchor="e")
+
+        tk.Button(self, text="Cancel", font=parent.f_btn, bg=FG_MUTED, fg=BG,
+                  activebackground=FG_MUTED, activeforeground=BG, bd=0,
+                  relief="flat", padx=14, pady=4, cursor="hand2",
+                  command=self._cancel).pack(anchor="e", padx=18, pady=(2, 14))
+
+        self.bind("<Escape>", lambda e: self._cancel())
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.grab_set()
+        self.wait_window(self)
+
+    def _pick(self, mode):
+        self.result = mode
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
 class Redirect(io.StringIO):
     """Send writes to a callback instead of the real stdout."""
 
@@ -600,6 +657,47 @@ class App(tk.Tk):
         self._card(grid, 0, CELLS[0])
         self._stacked_pair(grid, 1, CELLS[1], CELLS[2])
         self._fdr_card(grid, 2)
+        self._pier_section()
+
+    def _pier_section(self):
+        self._section_header(self._scroll, "Pier Labels",
+                             "Rebuild pier labels from the wall geometry")
+
+        border = tk.Frame(self._scroll, bg=BORDER, padx=1, pady=1)
+        border.pack(fill="x", padx=24, pady=(0, 24))
+        card = tk.Frame(border, bg=SURFACE)
+        card.pack(fill="both", expand=True)
+        tk.Frame(card, bg=AMBER, height=3).pack(fill="x")
+
+        body = tk.Frame(card, bg=SURFACE)
+        body.pack(fill="both", expand=True, padx=16, pady=12)
+
+        tk.Label(body, text="Renumber piers from geometry", font=self.f_title,
+                 fg=FG, bg=SURFACE, anchor="w").pack(fill="x")
+        tk.Label(body,
+                 text="Walls stacked at the same plan position share one "
+                      "label; two piers on a storey never do.",
+                 font=self.f_sub, fg=AMBER, bg=SURFACE, anchor="w",
+                 justify="left").pack(fill="x")
+        tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=9)
+        tk.Label(body,
+                 text="Openings need no special handling: the pieces of a "
+                      "pierced wall sit over the same plan run, so they group "
+                      "together on their own. Preview reports what would "
+                      "change without touching the model. The model must be "
+                      "unlocked to apply, so relabel before running analysis.",
+                 font=self.f_detail, fg=FG_DIM, bg=SURFACE, anchor="w",
+                 justify="left", wraplength=880).pack(fill="x")
+        tk.Frame(body, bg=SURFACE, height=10).pack()
+
+        row = tk.Frame(body, bg=SURFACE)
+        row.pack(fill="x")
+        for i, (text, key, accent, cmd) in enumerate((
+                ("Preview", "pier_preview", AMBER, self._relabel_preview),
+                ("Apply", "pier_apply", RED, self._relabel_apply))):
+            btn = self._flat_button(row, text, accent, cmd)
+            btn.pack(side="left", padx=(0 if i == 0 else 8, 0))
+            self._buttons[key] = btn
 
     def _card(self, parent, col, cell):
         accent = cell["accent"]
@@ -1167,6 +1265,112 @@ class App(tk.Tk):
         else:
             folder = os.path.basename(os.path.dirname(self._etabs_path))
             label.configure(text=folder or self._etabs_path, fg=FG_DIM)
+
+    # ── Pier relabelling ─────────────────────────────────────────────────────
+
+    def _relabel_preview(self):
+        model = self._sap_model()
+        if model is None:
+            return
+        self._disable(self._buttons["pier_preview"])
+        self._log("")
+        self._log("=" * 60, "info")
+        self._log("  PIER LABELS -- PREVIEW", "info")
+        self._log("=" * 60, "info")
+
+        def job():
+            import pier_relabel
+            return pier_relabel.relabel(
+                model, mode="all", write=False,
+                log=lambda m: self._post(self._log, str(m)))
+
+        def done(ok, payload, elapsed):
+            self._post(self._relabel_preview_done, ok, payload, elapsed)
+
+        self._worker.submit(job, done)
+
+    def _relabel_preview_done(self, ok, payload, elapsed):
+        self._enable(self._buttons["pier_preview"])
+        if not ok:
+            self._log(f"  Preview failed: {payload}", "err")
+            messagebox.showerror("Preview failed", str(payload), parent=self)
+            return
+        self._log(f"  Preview finished in {elapsed:.1f}s", "ok")
+        if payload.get("locked"):
+            self._log("  Apply is blocked until the model is unlocked.", "warn")
+
+    def _relabel_apply(self):
+        model = self._sap_model()
+        if model is None:
+            return
+
+        import pier_relabel
+        if pier_relabel.is_locked(model):
+            messagebox.showerror(
+                "Model is locked",
+                "This model has analysis results, so ETABS will not let pier "
+                "labels change.\n\n"
+                "Unlocking discards the results and the model must be "
+                "re-analysed, which can take hours on a large model.\n\n"
+                "Relabel first, then run the analysis, then the FDR.",
+                parent=self)
+            self._log("Apply refused: the model is locked.", "err")
+            return
+
+        mode = ChooseMode(self).result
+        if mode is None:
+            self._log("Relabelling cancelled.", "warn")
+            return
+
+        if not messagebox.askyesno(
+                "Rewrite pier labels?",
+                ("Every pier will be renumbered from its position."
+                 if mode == "all" else
+                 "Only piers whose labels clash will be renamed.")
+                + "\n\nThis changes the open model. It is NOT saved, so "
+                  "closing ETABS without saving still discards it.\n\n"
+                  "Continue?", parent=self):
+            self._log("Relabelling cancelled.", "warn")
+            return
+
+        self._disable(self._buttons["pier_apply"])
+        self._log("")
+        self._log("=" * 60, "info")
+        self._log(f"  PIER LABELS -- APPLYING ({mode})", "info")
+        self._log("=" * 60, "info")
+
+        def job():
+            import pier_relabel
+            return pier_relabel.relabel(
+                model, mode=mode, write=True,
+                log=lambda m: self._post(self._log, str(m)))
+
+        def done(ok, payload, elapsed):
+            self._post(self._relabel_apply_done, ok, payload, elapsed)
+
+        self._worker.submit(job, done)
+
+    def _relabel_apply_done(self, ok, payload, elapsed):
+        self._enable(self._buttons["pier_apply"])
+        if not ok:
+            self._log(f"  Relabelling failed: {payload}", "err")
+            messagebox.showerror("Relabelling failed", str(payload), parent=self)
+            return
+        written, failed = payload.get("written", (0, []))
+        if failed:
+            self._log(f"  {len(failed)} assignments failed", "err")
+            messagebox.showwarning(
+                "Partly applied",
+                f"{written} labels were set but {len(failed)} failed.\n\n"
+                "The model is now in a mixed state. Reopen it without saving "
+                "to get back to where you started.", parent=self)
+            return
+        self._log(f"  Relabelled {written} wall areas in {elapsed:.1f}s", "ok")
+        messagebox.showinfo(
+            "Pier labels rewritten",
+            f"{written} wall areas relabelled.\n\n"
+            "The model has NOT been saved. Check it in ETABS, then save there "
+            "if you are happy with it.", parent=self)
 
     # ── Connect: self-diagnosis ──────────────────────────────────────────────
 
