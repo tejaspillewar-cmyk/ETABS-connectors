@@ -1,0 +1,11 @@
+# ETABS Live Connector -- runtime dependencies
+# Install with:  pip install -r requirements.txt
+#
+# Windows only: comtypes drives the ETABS COM API, which does not exist
+# on other platforms. tkinter ships with CPython and is not listed here.
+
+comtypes>=1.4.16     # COM bridge to the ETABS OAPI (ETABSv1.Helper)
+psutil>=7.2.2        # finds the running ETABS.exe process to attach to
+pandas>=3.0.5        # result tables and the Excel writer front-end
+openpyxl>=3.1.5      # .xlsx engine used by pandas for the FDR report
+ezdxf>=1.4.4         # optional: "Export DXF" button only

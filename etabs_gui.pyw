@@ -3,7 +3,7 @@ ETABS Live Connector -- control panel for the ETABS COM API.
 
 Run with:
     pythonw etabs_gui.pyw       (no console window)
-    python  etabs_gui.py        (console visible, useful for debugging)
+    python  etabs_gui.pyw       (console visible, useful for debugging)
 
 Requirements:
     pip install comtypes psutil pandas openpyxl ezdxf
@@ -29,19 +29,53 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from tkinter import font as tkfont
 
 # ── Palette ───────────────────────────────────────────────────────────────────
-BG = "#0d1117"
-SURFACE = "#161b22"
-SURFACE2 = "#1c2128"
-BORDER = "#30363d"
-BLUE = "#2f81f7"
-BLUE_H = "#388bfd"
-GREEN = "#3fb950"
-RED = "#f85149"
-AMBER = "#d29922"
-PURPLE = "#bc8cff"
-FG = "#e6edf3"
-FG_DIM = "#8b949e"
-FG_MUTED = "#484f58"
+# Two full palettes; the one that matches the OS's current light/dark setting
+# is picked once at startup (see _system_prefers_dark below).
+_DARK = dict(
+    BG="#0d1117", SURFACE="#161b22", SURFACE2="#1c2128", BORDER="#30363d",
+    BLUE="#2f81f7", BLUE_H="#388bfd", GREEN="#3fb950", RED="#f85149",
+    AMBER="#d29922", PURPLE="#bc8cff", FG="#e6edf3", FG_DIM="#8b949e",
+    FG_MUTED="#484f58", CONSOLE_BG="#010409",
+)
+_LIGHT = dict(
+    BG="#f6f8fa", SURFACE="#ffffff", SURFACE2="#eef1f4", BORDER="#d0d7de",
+    BLUE="#0969da", BLUE_H="#0550ae", GREEN="#1a7f37", RED="#cf222e",
+    AMBER="#9a6700", PURPLE="#8250df", FG="#1f2328", FG_DIM="#57606a",
+    FG_MUTED="#8c959f", CONSOLE_BG="#ffffff",
+)
+
+
+def _system_prefers_dark():
+    """Read the Windows 'Apps use dark mode' setting; default to dark elsewhere."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        return value == 0
+    except Exception:
+        return True
+
+
+IS_DARK = _system_prefers_dark()
+_palette = _DARK if IS_DARK else _LIGHT
+BG = _palette["BG"]
+SURFACE = _palette["SURFACE"]
+SURFACE2 = _palette["SURFACE2"]
+BORDER = _palette["BORDER"]
+BLUE = _palette["BLUE"]
+BLUE_H = _palette["BLUE_H"]
+GREEN = _palette["GREEN"]
+RED = _palette["RED"]
+AMBER = _palette["AMBER"]
+PURPLE = _palette["PURPLE"]
+FG = _palette["FG"]
+FG_DIM = _palette["FG_DIM"]
+FG_MUTED = _palette["FG_MUTED"]
+CONSOLE_BG = _palette["CONSOLE_BG"]
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 DEFAULT_ETABS_PATH = r"C:\Program Files\Computers and Structures\ETABS 23\ETABS.exe"
@@ -81,15 +115,19 @@ LAUNCH_CODE = (
 
 ATTACH_CODE = (
     "import comtypes.client, psutil\n"
-    "procs = [p.info for p in psutil.process_iter(['pid', 'name'])\n"
-    "         if p.info['name'] and 'ETABS' in p.info['name'].upper()]\n"
-    "if not procs:\n"
-    "    raise RuntimeError('No running ETABS process found. Open ETABS first.')\n"
-    "if len(procs) > 1:\n"
-    "    listed = ', '.join(f\"PID {p['pid']} ({p['name']})\" for p in procs)\n"
-    "    raise RuntimeError('Several ETABS instances are running: ' + listed)\n"
-    "pid = procs[0]['pid']\n"
-    "print('Attaching to ETABS PID', pid)\n"
+    "pid = globals().pop('attach_pid', None)\n"
+    "if pid:\n"
+    "    print('Attaching to ETABS PID', pid, '(requested by plugin)')\n"
+    "else:\n"
+    "    procs = [p.info for p in psutil.process_iter(['pid', 'name'])\n"
+    "             if p.info['name'] and 'ETABS' in p.info['name'].upper()]\n"
+    "    if not procs:\n"
+    "        raise RuntimeError('No running ETABS process found. Open ETABS first.')\n"
+    "    if len(procs) > 1:\n"
+    "        listed = ', '.join(f\"PID {p['pid']} ({p['name']})\" for p in procs)\n"
+    "        raise RuntimeError('Several ETABS instances are running: ' + listed)\n"
+    "    pid = procs[0]['pid']\n"
+    "    print('Attaching to ETABS PID', pid)\n"
     "helper = comtypes.client.CreateObject('ETABSv1.Helper')\n"
     "helper = helper.QueryInterface(comtypes.gen.ETABSv1.cHelper)\n"
     "myETABSObject = helper.GetObjectProcess('CSI.ETABS.API.ETABSObject', pid)\n"
@@ -179,10 +217,6 @@ class EtabsWorker:
         """
         self._jobs.put((fn, on_done))
 
-    @property
-    def busy(self) -> bool:
-        return not self._jobs.empty()
-
     def _loop(self):
         try:
             import comtypes
@@ -249,6 +283,28 @@ class App(tk.Tk):
         self._style()
         self._build()
         self._pump()
+        self._dark_titlebar()
+
+        if NS.get("attach_pid"):
+            # Launched by the ETABS plugin for a specific instance -- attach
+            # to it automatically instead of waiting for a button click.
+            self.after(150, lambda: self._run_cell(CELLS[0], "attach"))
+
+    def _dark_titlebar(self):
+        """Match the native title bar to the app's theme (Windows 10 20H1+)."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            value = ctypes.c_int(1 if IS_DARK else 0)
+            for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE, old builds
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                        hwnd, attr, ctypes.byref(value),
+                        ctypes.sizeof(value)) == 0:
+                    break
+        except Exception:
+            pass
 
     # ── Fonts and ttk style ──────────────────────────────────────────────────
 
@@ -293,12 +349,28 @@ class App(tk.Tk):
     def _build(self):
         self._topbar()
         tk.Frame(self, bg=BLUE, height=2).pack(fill="x")
-        # Bottom-up: console lowest, then the action bar, then the scroll area
-        # takes whatever is left. Run and the two Save buttons therefore stay
-        # on screen no matter how far the panel above is scrolled.
-        self._console_area()
-        self._action_bar()
-        self._main_area()
+
+        # A vertical sash lets the user trade space between the scrollable
+        # input panel (top) and the action bar + console (bottom) -- drag it
+        # to give more room to whichever side they need.
+        paned = tk.PanedWindow(self, orient="vertical", bg=BORDER, bd=0,
+                               sashwidth=6, sashrelief="flat",
+                               opaqueresize=True)
+        paned.pack(fill="both", expand=True)
+
+        top_pane = tk.Frame(paned, bg=BG)
+        bottom_pane = tk.Frame(paned, bg=SURFACE2)
+        paned.add(top_pane, minsize=240, stretch="always")
+        paned.add(bottom_pane, minsize=140, stretch="always")
+
+        # The action bar sits above the console inside the bottom pane, so
+        # Run/Save stay attached to the console instead of the scroll area.
+        self._action_bar(bottom_pane)
+        self._console_area(bottom_pane)
+        self._main_area(top_pane)
+
+        self.after(60, lambda: paned.sash_place(
+            0, 0, max(1, int(self.winfo_height() * 0.66))))
 
     # ── Thread-safe hand-off to the Tk thread ────────────────────────────────
     #
@@ -343,8 +415,8 @@ class App(tk.Tk):
                                     font=self.f_status, fg=FG_DIM, bg=SURFACE2)
         self._status_txt.pack(side="right", pady=18)
 
-    def _main_area(self):
-        wrap = tk.Frame(self, bg=BG)
+    def _main_area(self, parent):
+        wrap = tk.Frame(parent, bg=BG)
         wrap.pack(fill="both", expand=True)
 
         canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0, bd=0)
@@ -361,12 +433,31 @@ class App(tk.Tk):
             lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>",
                     lambda e: canvas.itemconfig(window, width=e.width))
-        canvas.bind_all(
-            "<MouseWheel>",
-            lambda e: canvas.yview_scroll(-1 * int(e.delta / 120), "units"))
 
         self._cards_section()
-        self._fdr_section()
+        self._bind_scroll(canvas)
+
+    def _bind_scroll(self, canvas):
+        """Bind the wheel directly on every widget in the scroll area.
+
+        A single canvas.bind_all() looked like the standard recipe, but on
+        this app it silently did nothing except over the scrollbar itself --
+        wheel events were reaching the child labels/frames first and going
+        nowhere. Binding on each widget explicitly is what actually works.
+        """
+        def on_wheel(e):
+            # The combo list and the console scroll themselves; leave them be.
+            if isinstance(e.widget, (tk.Listbox, tk.Text)):
+                return
+            canvas.yview_scroll(-1 * int(e.delta / 120), "units")
+
+        def bind_tree(widget):
+            widget.bind("<MouseWheel>", on_wheel, add="+")
+            for child in widget.winfo_children():
+                bind_tree(child)
+
+        canvas.bind("<MouseWheel>", on_wheel, add="+")
+        bind_tree(self._scroll)
 
     # ── Cards ────────────────────────────────────────────────────────────────
 
@@ -380,13 +471,15 @@ class App(tk.Tk):
 
     def _cards_section(self):
         self._section_header(self._scroll, "Connection",
-                             "Connect first, then use the FDR panel below")
+                             "Connect, check the model, then set up FDR")
         grid = tk.Frame(self._scroll, bg=BG)
-        grid.pack(fill="x", padx=24)
-        for col in range(len(CELLS)):
+        grid.pack(fill="x", padx=24, pady=(0, 24))
+        for col in range(3):
             grid.columnconfigure(col, weight=1)
-        for col, cell in enumerate(CELLS):
-            self._card(grid, col, cell)
+
+        self._card(grid, 0, CELLS[0])
+        self._stacked_pair(grid, 1, CELLS[1], CELLS[2])
+        self._fdr_card(grid, 2)
 
     def _card(self, parent, col, cell):
         accent = cell["accent"]
@@ -432,6 +525,54 @@ class App(tk.Tk):
                      padx=(0 if i == 0 else 6, 0))
             self._buttons[key] = btn
 
+    def _stacked_pair(self, parent, col, cell_top, cell_bottom):
+        """Two compact cards stacked in one grid column, e.g. cards 02+03."""
+        wrap = tk.Frame(parent, bg=BG)
+        wrap.grid(row=0, column=col, padx=(8, 0), sticky="nsew")
+        wrap.columnconfigure(0, weight=1)
+        self._mini_card(wrap, 0, cell_top)
+        self._mini_card(wrap, 1, cell_bottom)
+
+    def _mini_card(self, parent, row, cell):
+        """A compact variant of _card for the stacked column."""
+        accent = cell["accent"]
+
+        border = tk.Frame(parent, bg=BORDER, padx=1, pady=1)
+        border.grid(row=row, column=0, sticky="nsew",
+                    pady=(0 if row == 0 else 8, 0))
+        card = tk.Frame(border, bg=SURFACE)
+        card.pack(fill="both", expand=True)
+        tk.Frame(card, bg=accent, height=3).pack(fill="x")
+
+        body = tk.Frame(card, bg=SURFACE)
+        body.pack(fill="both", expand=True, padx=14, pady=10)
+
+        top = tk.Frame(body, bg=SURFACE)
+        top.pack(fill="x")
+        tk.Label(top, text=cell["label"], font=self.f_title, fg=accent,
+                 bg=SURFACE).pack(side="left")
+        tk.Label(top, text=cell["title"], font=self.f_title, fg=FG,
+                 bg=SURFACE).pack(side="left", padx=(8, 0))
+
+        tk.Label(body, text=cell["subtitle"], font=self.f_sub, fg=accent,
+                 bg=SURFACE, anchor="w", wraplength=260,
+                 justify="left").pack(fill="x", pady=(4, 8))
+
+        badge = tk.Label(body, text="IDLE", font=self.f_badge, fg=BG,
+                         bg=FG_MUTED, padx=6, pady=2)
+        badge.pack(anchor="w", pady=(0, 8))
+        self._badges[cell["id"]] = badge
+
+        row_btns = tk.Frame(body, bg=SURFACE)
+        row_btns.pack(fill="x")
+        for i, (text, key) in enumerate(cell["actions"]):
+            btn = self._flat_button(
+                row_btns, text, accent,
+                lambda k=key, c=cell: self._run_cell(c, k), small=True)
+            btn.pack(side="left", expand=True, fill="x",
+                     padx=(0 if i == 0 else 6, 0))
+            self._buttons[key] = btn
+
     def _flat_button(self, parent, text, accent, command, small=False):
         btn = tk.Button(
             parent, text=text, font=self.f_btn, fg="white", bg=accent,
@@ -465,112 +606,110 @@ class App(tk.Tk):
 
     # ── FDR panel ────────────────────────────────────────────────────────────
 
-    def _fdr_section(self):
-        self._section_header(
-            self._scroll, "FDR  --  Flexural Design Review",
-            "Required Pt%, 0.4 fck and 0.2 fck checks, Excel and DXF output")
+    def _fdr_card(self, parent, col):
+        """The FDR setup, styled as a card in the same row as 01/02+03.
 
-        border = tk.Frame(self._scroll, bg=BORDER, padx=1, pady=1)
-        border.pack(fill="x", padx=24, pady=(0, 24))
-        panel = tk.Frame(border, bg=SURFACE)
-        panel.pack(fill="both", expand=True)
-        tk.Frame(panel, bg=AMBER, height=3).pack(fill="x")
+        Kept narrow (one grid column) on purpose, rather than the old
+        full-width panel, to leave room to add more cards alongside it later.
+        """
+        accent = AMBER
 
-        body = tk.Frame(panel, bg=SURFACE)
-        body.pack(fill="both", expand=True, padx=16, pady=14)
+        border = tk.Frame(parent, bg=BORDER, padx=1, pady=1)
+        border.grid(row=0, column=col, padx=(8, 0), sticky="nsew")
+        card = tk.Frame(border, bg=SURFACE)
+        card.pack(fill="both", expand=True)
+        tk.Frame(card, bg=accent, height=3).pack(fill="x")
 
-        # -- Row 1: material and drawing inputs ---------------------------
-        inputs = tk.Frame(body, bg=SURFACE)
-        inputs.pack(fill="x")
+        body = tk.Frame(card, bg=SURFACE)
+        body.pack(fill="both", expand=True, padx=16, pady=12)
 
+        tk.Label(body, text="FDR", font=self.f_title, fg=FG, bg=SURFACE,
+                 anchor="w").pack(fill="x")
+        tk.Label(body, text="Flexural Design Review", font=self.f_sub,
+                 fg=accent, bg=SURFACE, anchor="w").pack(fill="x")
+        tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=9)
+        tk.Label(body,
+                 text="Required Pt%, 0.4 fck and 0.2 fck checks, Excel and "
+                      "DXF output.",
+                 font=self.f_detail, fg=FG_DIM, bg=SURFACE, anchor="w",
+                 justify="left", wraplength=260).pack(fill="x")
+        tk.Frame(body, bg=SURFACE, height=8).pack()
+
+        # -- Material and drawing inputs ------------------------------------
         self.var_fy = tk.StringVar(value=DEFAULT_FY)
         self.var_fck = tk.StringVar(value=DEFAULT_FCK)
         self.var_text_h = tk.StringVar(value=DEFAULT_TEXT_HEIGHT)
         self.var_wind = tk.StringVar(value=DEFAULT_WIND_KEYWORDS)
         self.var_story = tk.StringVar(value=ALL_STORIES)
 
-        self._field(inputs, "fy (MPa)", self.var_fy, width=7).pack(side="left")
-        self._field(inputs, "fck (MPa)", self.var_fck,
-                    width=7).pack(side="left", padx=(14, 0))
-        self._field(inputs, "DXF text height (mm)", self.var_text_h,
-                    width=8).pack(side="left", padx=(14, 0))
-        self._field(inputs, "Wind keywords (comma separated)", self.var_wind,
-                    width=34).pack(side="left", padx=(14, 0), fill="x",
-                                   expand=True)
+        fy_fck = tk.Frame(body, bg=SURFACE)
+        fy_fck.pack(fill="x", pady=(0, 8))
+        self._field(fy_fck, "fy (MPa)", self.var_fy).pack(
+            side="left", fill="x", expand=True)
+        self._field(fy_fck, "fck (MPa)", self.var_fck).pack(
+            side="left", fill="x", expand=True, padx=(8, 0))
 
-        # -- Row 1b: text stack offsets ------------------------------------
-        offsets = tk.Frame(body, bg=SURFACE)
-        offsets.pack(fill="x", pady=(12, 0))
+        self._field(body, "DXF text height (mm)", self.var_text_h).pack(
+            fill="x", pady=(0, 8))
+        self._field(body, "Wind keywords (comma separated)",
+                    self.var_wind).pack(fill="x", pady=(0, 10))
 
+        # -- Text stack offsets ----------------------------------------------
         self.var_offset_pier = tk.StringVar(value=DEFAULT_OFFSET_PIER)
         self.var_offset_pt = tk.StringVar(value=DEFAULT_OFFSET_PT)
         self.var_offset_as = tk.StringVar(value=DEFAULT_OFFSET_AS)
 
-        self._field(offsets, "Pier-to-text gap (mm)", self.var_offset_pier,
-                    width=8).pack(side="left")
-        self._field(offsets, "Label-to-Pt% spacing (mm)", self.var_offset_pt,
-                    width=8).pack(side="left", padx=(14, 0))
-        self._field(offsets, "Pt%-to-As spacing (mm)", self.var_offset_as,
-                    width=8).pack(side="left", padx=(14, 0))
-        tk.Label(offsets,
-                 text="Stack (bottom to top): Pier label, Required Pt%, As Required.",
-                 font=self.f_detail, fg=FG_MUTED, bg=SURFACE,
-                 wraplength=280, justify="left").pack(side="left", padx=(14, 0))
+        tk.Label(body, text="Text stack offsets (mm)", font=self.f_badge,
+                 fg=FG_DIM, bg=SURFACE, anchor="w").pack(fill="x", pady=(0, 4))
+        self._field(body, "Pier-to-text gap", self.var_offset_pier).pack(
+            fill="x", pady=(0, 6))
+        self._field(body, "Label-to-Pt% spacing", self.var_offset_pt).pack(
+            fill="x", pady=(0, 6))
+        self._field(body, "Pt%-to-As spacing", self.var_offset_as).pack(
+            fill="x", pady=(0, 6))
+        tk.Label(body,
+                 text="Stack (bottom to top): Pier label, Required Pt%, "
+                      "As Required.",
+                 font=self.f_detail, fg=FG_MUTED, bg=SURFACE, anchor="w",
+                 wraplength=260, justify="left").pack(fill="x", pady=(0, 10))
 
-        # -- Row 1c: text content options -----------------------------------
-        text_opts = tk.Frame(body, bg=SURFACE)
-        text_opts.pack(fill="x", pady=(10, 0))
-
+        # -- Text content options ---------------------------------------------
         self.var_show_percent = tk.BooleanVar(value=True)
         self.var_plot_min_values = tk.BooleanVar(value=True)
 
-        self._checkbox(text_opts, "Show \"%\" symbol on Required Pt% text",
-                       self.var_show_percent).pack(side="left")
+        self._checkbox(body, "Show \"%\" symbol on Required Pt% text",
+                       self.var_show_percent).pack(anchor="w")
         self._checkbox(
-            text_opts,
-            "Plot values for minimum-governed piers (blank = governed by minimum)",
+            body,
+            "Plot values for minimum-governed piers",
             self.var_plot_min_values
-        ).pack(side="left", padx=(20, 0))
+        ).pack(anchor="w", pady=(2, 10))
 
-        # -- Row 2: story + refresh ---------------------------------------
-        row2 = tk.Frame(body, bg=SURFACE)
-        row2.pack(fill="x", pady=(12, 0))
-
-        story_box = tk.Frame(row2, bg=SURFACE)
-        story_box.pack(side="left")
-        tk.Label(story_box, text="Story", font=self.f_badge, fg=FG_DIM,
+        # -- Story + refresh ---------------------------------------------------
+        tk.Label(body, text="Story", font=self.f_badge, fg=FG_DIM,
                  bg=SURFACE, anchor="w").pack(fill="x")
         self.cmb_story = ttk.Combobox(
-            story_box, textvariable=self.var_story, values=[ALL_STORIES],
-            state="readonly", width=28, style="Dark.TCombobox",
-            font=self.f_field)
-        self.cmb_story.pack()
+            body, textvariable=self.var_story, values=[ALL_STORIES],
+            state="readonly", style="Dark.TCombobox", font=self.f_field)
+        self.cmb_story.pack(fill="x", pady=(2, 8))
 
         btn_refresh = self._flat_button(
-            row2, "Read stories + combos", BLUE, self._load_model_lists,
+            body, "Read stories + combos", BLUE, self._load_model_lists,
             small=True)
-        btn_refresh.pack(side="left", padx=(14, 0), pady=(14, 0))
+        btn_refresh.pack(fill="x", pady=(0, 6))
         self._buttons["refresh"] = btn_refresh
 
-        tk.Label(row2,
+        tk.Label(body,
                  text="A DXF covers one story. Leave on All stories for a "
                       "whole-building Excel report.",
-                 font=self.f_detail, fg=FG_MUTED, bg=SURFACE,
-                 wraplength=340, justify="left").pack(side="left", padx=(14, 0),
-                                                      pady=(14, 0))
+                 font=self.f_detail, fg=FG_MUTED, bg=SURFACE, anchor="w",
+                 wraplength=260, justify="left").pack(fill="x", pady=(0, 10))
 
-        # -- Row 3: combination picker ------------------------------------
-        combo_wrap = tk.Frame(body, bg=SURFACE)
-        combo_wrap.pack(fill="x", pady=(14, 0))
-
-        head = tk.Frame(combo_wrap, bg=SURFACE)
+        # -- Combination picker -------------------------------------------------
+        head = tk.Frame(body, bg=SURFACE)
         head.pack(fill="x")
         tk.Label(head, text="Load combinations", font=self.f_badge, fg=FG_DIM,
                  bg=SURFACE).pack(side="left")
-        self.lbl_combo_count = tk.Label(head, text="none loaded",
-                                        font=self.f_detail, fg=FG_MUTED,
-                                        bg=SURFACE)
-        self.lbl_combo_count.pack(side="left", padx=8)
         tk.Button(head, text="None", font=self.f_badge, fg=FG_DIM, bg=SURFACE,
                   activebackground=BORDER, activeforeground=FG, relief="flat",
                   padx=6, cursor="hand2",
@@ -582,10 +721,15 @@ class App(tk.Tk):
                   command=lambda: self.lst_combos.selection_set(0, "end")
                   ).pack(side="right", padx=4)
 
-        list_frame = tk.Frame(combo_wrap, bg=BORDER, padx=1, pady=1)
-        list_frame.pack(fill="x", pady=(4, 0))
+        self.lbl_combo_count = tk.Label(body, text="none loaded",
+                                        font=self.f_detail, fg=FG_MUTED,
+                                        bg=SURFACE, anchor="w")
+        self.lbl_combo_count.pack(fill="x", pady=(2, 4))
+
+        list_frame = tk.Frame(body, bg=BORDER, padx=1, pady=1)
+        list_frame.pack(fill="x")
         self.lst_combos = tk.Listbox(
-            list_frame, selectmode="extended", height=5, bg=SURFACE2, fg=FG,
+            list_frame, selectmode="extended", height=6, bg=SURFACE2, fg=FG,
             selectbackground=BLUE, selectforeground="white", relief="flat",
             highlightthickness=0, font=self.f_field,
             exportselection=False)
@@ -596,16 +740,16 @@ class App(tk.Tk):
         sb.pack(side="right", fill="y")
         self.lst_combos.pack(side="left", fill="both", expand=True)
 
-        tk.Label(combo_wrap,
+        tk.Label(body,
                  text="Nothing selected means every combination is used.",
-                 font=self.f_detail, fg=FG_MUTED,
-                 bg=SURFACE).pack(anchor="w", pady=(4, 0))
+                 font=self.f_detail, fg=FG_MUTED, bg=SURFACE, anchor="w",
+                 wraplength=260, justify="left").pack(fill="x", pady=(4, 0))
 
     # ── Action bar (always visible, sits just above the console) ─────────────
 
-    def _action_bar(self):
-        bar = tk.Frame(self, bg=SURFACE2)
-        bar.pack(fill="x", side="bottom")
+    def _action_bar(self, parent):
+        bar = tk.Frame(parent, bg=SURFACE2)
+        bar.pack(fill="x", side="top")
         tk.Frame(bar, bg=BORDER, height=1).pack(fill="x")
 
         inner = tk.Frame(bar, bg=SURFACE2)
@@ -652,9 +796,9 @@ class App(tk.Tk):
 
     # ── Console ──────────────────────────────────────────────────────────────
 
-    def _console_area(self):
-        frame = tk.Frame(self, bg=SURFACE2)
-        frame.pack(fill="x", side="bottom")
+    def _console_area(self, parent):
+        frame = tk.Frame(parent, bg=SURFACE2)
+        frame.pack(fill="both", expand=True, side="top")
 
         head = tk.Frame(frame, bg=SURFACE2)
         head.pack(fill="x", padx=16, pady=(10, 0))
@@ -672,10 +816,10 @@ class App(tk.Tk):
         tk.Frame(frame, bg=BORDER, height=1).pack(fill="x", pady=(6, 0))
 
         self._con = scrolledtext.ScrolledText(
-            frame, font=self.f_con, bg="#010409", fg=FG, insertbackground=FG,
+            frame, font=self.f_con, bg=CONSOLE_BG, fg=FG, insertbackground=FG,
             relief="flat", bd=0, highlightthickness=0, state="disabled",
             height=CONSOLE_LINES, wrap="none")
-        self._con.pack(fill="x")
+        self._con.pack(fill="both", expand=True)
         self._con.tag_config("err", foreground=RED)
         self._con.tag_config("ok", foreground=GREEN)
         self._con.tag_config("info", foreground=BLUE)
@@ -1143,4 +1287,26 @@ class App(tk.Tk):
 if __name__ == "__main__":
     # Make sure `import fdr_tool` works no matter where the app is started from.
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+    # --pid <N> is passed by the ETABS plugin (see etabs_plugin/) so this GUI
+    # attaches to the exact instance that launched it, instead of guessing.
+    if "--pid" in sys.argv:
+        try:
+            NS["attach_pid"] = int(sys.argv[sys.argv.index("--pid") + 1])
+        except (ValueError, IndexError):
+            pass
+
+    if sys.platform == "win32":
+        # Without this, Windows bitmap-scales the whole window on displays
+        # set above 100% scaling, which blurs the UI and inflates its size.
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            try:
+                import ctypes
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
     App().mainloop()

@@ -1083,14 +1083,12 @@ class FDRTool:
         try:
             import openpyxl
             from openpyxl.styles import PatternFill, Border, Side, Font
-            from openpyxl.utils import get_column_letter
         except ImportError:
             self.log("Installing openpyxl for Excel export...")
             import subprocess
             subprocess.check_call(['pip', 'install', 'openpyxl'])
             import openpyxl
             from openpyxl.styles import PatternFill, Border, Side, Font
-            from openpyxl.utils import get_column_letter
 
         if output_path is None:
             import tkinter as tk
