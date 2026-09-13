@@ -28,6 +28,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from tkinter import font as tkfont
 
+import app_paths
+
 # ── Palette ───────────────────────────────────────────────────────────────────
 # Two full palettes; the one that matches the OS's current light/dark setting
 # is picked once at startup (see _system_prefers_dark below).
@@ -78,7 +80,6 @@ FG_MUTED = _palette["FG_MUTED"]
 CONSOLE_BG = _palette["CONSOLE_BG"]
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-DEFAULT_ETABS_PATH = r"C:\Program Files\Computers and Structures\ETABS 23\ETABS.exe"
 DEFAULT_FY = "500"
 DEFAULT_FCK = "30"
 DEFAULT_TEXT_HEIGHT = "150"
@@ -97,14 +98,38 @@ UI_POLL_MS = 40          # how often the Tk thread drains the worker's queue
 NS = {}
 
 
+def _etabs_helper():
+    """Create the ETABS COM helper, explaining the usual failure.
+
+    Both connect paths start here. comtypes generates its ETABSv1 wrapper on
+    first use; on a machine where ETABS was never installed (or registered
+    badly) that surfaces as an AttributeError from deep inside comtypes, which
+    tells the user nothing.
+    """
+    import comtypes.client
+    try:
+        helper = comtypes.client.CreateObject("ETABSv1.Helper")
+        import comtypes.gen.ETABSv1
+        return helper.QueryInterface(comtypes.gen.ETABSv1.cHelper)
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not load the ETABS COM API (ETABSv1.Helper).\n\n"
+            "This usually means ETABS is not installed on this machine, or "
+            "its COM registration is damaged. Reinstalling or repairing ETABS "
+            "normally fixes it.\n\n"
+            f"Original error: {exc}") from exc
+
+
+NS["_etabs_helper"] = _etabs_helper
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Cell definitions
 # ═════════════════════════════════════════════════════════════════════════════
 
 LAUNCH_CODE = (
-    "import comtypes.client\n"
-    "helper = comtypes.client.CreateObject('ETABSv1.Helper')\n"
-    "helper = helper.QueryInterface(comtypes.gen.ETABSv1.cHelper)\n"
+    "import comtypes.gen.ETABSv1\n"
+    "helper = _etabs_helper()\n"
     "print('Launching ETABS from:', etabs_path)\n"
     "myETABSObject = helper.CreateObject(etabs_path)\n"
     "myETABSObject.ApplicationStart()\n"
@@ -113,26 +138,21 @@ LAUNCH_CODE = (
     "print('Connected. Open your .edb model in the ETABS window.')"
 )
 
+# The PID is always chosen before this runs -- see App._attach_pid_then_run,
+# which handles the none/one/several cases on the Tk thread so it can ask.
 ATTACH_CODE = (
-    "import comtypes.client, psutil\n"
+    "import comtypes.gen.ETABSv1\n"
     "pid = globals().pop('attach_pid', None)\n"
-    "if pid:\n"
-    "    print('Attaching to ETABS PID', pid, '(requested by plugin)')\n"
-    "else:\n"
-    "    procs = [p.info for p in psutil.process_iter(['pid', 'name'])\n"
-    "             if p.info['name'] and 'ETABS' in p.info['name'].upper()]\n"
-    "    if not procs:\n"
-    "        raise RuntimeError('No running ETABS process found. Open ETABS first.')\n"
-    "    if len(procs) > 1:\n"
-    "        listed = ', '.join(f\"PID {p['pid']} ({p['name']})\" for p in procs)\n"
-    "        raise RuntimeError('Several ETABS instances are running: ' + listed)\n"
-    "    pid = procs[0]['pid']\n"
-    "    print('Attaching to ETABS PID', pid)\n"
-    "helper = comtypes.client.CreateObject('ETABSv1.Helper')\n"
-    "helper = helper.QueryInterface(comtypes.gen.ETABSv1.cHelper)\n"
+    "if not pid:\n"
+    "    raise RuntimeError('No ETABS instance was selected.')\n"
+    "print('Attaching to ETABS PID', pid)\n"
+    "helper = _etabs_helper()\n"
     "myETABSObject = helper.GetObjectProcess('CSI.ETABS.API.ETABSObject', pid)\n"
     "if myETABSObject is None:\n"
-    "    raise RuntimeError('Attach failed. Is the model fully loaded?')\n"
+    "    raise RuntimeError(\n"
+    "        'ETABS refused the connection (PID ' + str(pid) + ').\\n\\n'\n"
+    "        'Most often the model is still loading -- wait for ETABS to finish "
+    "opening it and try again.')\n"
     "myETABSObject = myETABSObject.QueryInterface(comtypes.gen.ETABSv1.cOAPI)\n"
     "SapModel = myETABSObject.SapModel\n"
     "print('Attached. Active file:', SapModel.GetModelFilename() or '(none)')"
@@ -162,7 +182,8 @@ CELLS = [
                    "the registry ProgID. Attach grabs an ETABS that is already "
                    "running, by process id."),
         "accent": BLUE,
-        "actions": [("Launch", "launch"), ("Attach", "attach")],
+        "actions": [("Launch", "launch"), ("Attach", "attach"),
+                    ("Diagnose", "diagnose")],
         "is_connect": True,
     },
     {
@@ -237,8 +258,78 @@ class EtabsWorker:
                 try:
                     on_done(ok, payload, elapsed)
                 except Exception:
-                    traceback.print_exc()
+                    # Not print_exc(): stderr is None under pythonw, so that
+                    # would raise a second error on top of this one.
+                    _write_crash_log(traceback.format_exc())
             self._jobs.task_done()
+
+
+class ChooseInstance(tk.Toplevel):
+    """Modal picker for which running ETABS to attach to.
+
+    Instances are listed by the model they have open, because a bare PID
+    means nothing to the person choosing.
+    """
+
+    def __init__(self, parent, options):
+        super().__init__(parent)
+        self.result = None
+        # Not self._options -- that name is a tkinter.Misc internal.
+        self._choices = options
+
+        self.title("Which ETABS?")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.transient(parent)
+
+        tk.Label(self, text="Several ETABS instances are running.\n"
+                            "Choose the one to connect to:",
+                 font=parent.f_field, bg=BG, fg=FG, justify="left").pack(
+            anchor="w", padx=16, pady=(14, 8))
+
+        self._list = tk.Listbox(
+            self, height=min(8, len(options)), width=58, font=parent.f_field,
+            bg=SURFACE2, fg=FG, selectbackground=BLUE, selectforeground=FG,
+            highlightthickness=0, bd=0, activestyle="none")
+        for pid, label, _exe in options:
+            name = os.path.basename(label) if label else "(no model open)"
+            self._list.insert("end", f"   {name}    -  PID {pid}")
+        self._list.selection_set(0)
+        self._list.pack(fill="x", padx=16)
+
+        row = tk.Frame(self, bg=BG)
+        row.pack(fill="x", padx=16, pady=14)
+        for text, accent, cmd in (("Cancel", FG_MUTED, self._cancel),
+                                  ("Connect", BLUE, self._ok)):
+            tk.Button(row, text=text, font=parent.f_btn, bg=accent, fg=BG,
+                      activebackground=accent, activeforeground=BG, bd=0,
+                      relief="flat", padx=14, pady=5, cursor="hand2",
+                      command=cmd).pack(side="right", padx=(8, 0))
+
+        self._list.bind("<Double-Button-1>", lambda e: self._ok())
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self._cancel())
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+        self.grab_set()
+        self._list.focus_set()
+        self.wait_window(self)
+
+    def _ok(self):
+        sel = self._list.curselection()
+        if sel:
+            pid, _label, exe = self._choices[sel[0]]
+            self.result = (pid, exe)
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
 
 
 class Redirect(io.StringIO):
@@ -278,6 +369,15 @@ class App(tk.Tk):
         self._ui_queue = queue.Queue()
         self._tool = None           # fdr_tool.FDRTool once analysis has run
         self._fdr_running = False
+        self._closing = False
+        self._pump_id = None
+
+        # Resolved before _build(), which renders it onto card 01. A running
+        # ETABS wins over the saved value, so the path self-corrects whenever
+        # the user opens a different install.
+        self._etabs_path = app_paths.resolve_etabs_path()
+        if self._etabs_path:
+            app_paths.update_setting("etabs_path", self._etabs_path)
 
         self._fonts()
         self._style()
@@ -382,16 +482,33 @@ class App(tk.Tk):
         self._ui_queue.put((fn, args))
 
     def _pump(self):
+        if self._closing:
+            return
         try:
             while True:
                 fn, args = self._ui_queue.get_nowait()
                 try:
                     fn(*args)
                 except Exception:
-                    traceback.print_exc()
+                    text = traceback.format_exc()
+                    _write_crash_log(text)
+                    self._write(text, "err")
         except queue.Empty:
             pass
-        self.after(UI_POLL_MS, self._pump)
+        self._pump_id = self.after(UI_POLL_MS, self._pump)
+
+    def destroy(self):
+        # Without this the queued _pump fires once more against a half-torn-down
+        # window, and Tk reports it as an error -- which now means a dialog in
+        # the user's face as they close the app.
+        self._closing = True
+        if self._pump_id is not None:
+            try:
+                self.after_cancel(self._pump_id)
+            except Exception:
+                pass
+            self._pump_id = None
+        super().destroy()
 
     def _topbar(self):
         bar = tk.Frame(self, bg=SURFACE2, height=54)
@@ -515,6 +632,9 @@ class App(tk.Tk):
         badge.pack(anchor="w", pady=(0, 8))
         self._badges[cell["id"]] = badge
 
+        if cell.get("is_connect"):
+            self._etabs_path_row(body)
+
         row = tk.Frame(body, bg=SURFACE)
         row.pack(fill="x")
         for i, (text, key) in enumerate(cell["actions"]):
@@ -524,6 +644,26 @@ class App(tk.Tk):
             btn.pack(side="left", expand=True, fill="x",
                      padx=(0 if i == 0 else 6, 0))
             self._buttons[key] = btn
+
+    def _etabs_path_row(self, parent):
+        """Which ETABS Launch will start, with a way to correct it.
+
+        Only Launch reads this -- Attach finds ETABS by process id -- so it
+        stays a quiet one-liner rather than a settings screen.
+        """
+        row = tk.Frame(parent, bg=SURFACE)
+        row.pack(fill="x", pady=(0, 8))
+
+        tk.Label(row, text="ETABS:", font=self.f_detail, fg=FG_MUTED,
+                 bg=SURFACE).pack(side="left")
+        tk.Button(row, text="Change…", font=self.f_detail, fg=FG_DIM,
+                  bg=SURFACE, activebackground=SURFACE, activeforeground=FG,
+                  bd=0, relief="flat", padx=4, pady=0, cursor="hand2",
+                  command=self._pick_etabs).pack(side="right")
+        self.lbl_etabs = tk.Label(row, text="", font=self.f_detail, fg=FG_DIM,
+                                  bg=SURFACE, anchor="w")
+        self.lbl_etabs.pack(side="left", fill="x", expand=True, padx=(4, 4))
+        self._refresh_etabs_label()
 
     def _stacked_pair(self, parent, col, cell_top, cell_bottom):
         """Two compact cards stacked in one grid column, e.g. cards 02+03."""
@@ -834,6 +974,28 @@ class App(tk.Tk):
     def _log(self, text, tag=None):
         self._write(text if text.endswith("\n") else text + "\n", tag)
 
+    def report_callback_exception(self, exc_type, exc, tb):
+        """Tk calls this by name when a widget callback raises.
+
+        Tk's default implementation prints to stderr, which is None under
+        pythonw.exe -- so without this override an error inside any button
+        handler or .after() job disappears completely.
+        """
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        if self._closing:
+            _write_crash_log(text)   # teardown noise: log it, don't nag
+            return
+        try:
+            self._write(text, "err")
+        except Exception:
+            pass
+        path = _write_crash_log(text)
+        messagebox.showerror(
+            "Unexpected error",
+            f"{exc_type.__name__}: {exc}"
+            + (f"\n\nFull report:\n{path}" if path else ""),
+            parent=self)
+
     def _clear(self):
         self._con.configure(state="normal")
         self._con.delete("1.0", "end")
@@ -850,9 +1012,239 @@ class App(tk.Tk):
             fh.write(self._con.get("1.0", "end"))
         self._log(f"Log saved: {path}", "ok")
 
+    # ── Connect: deciding what to connect to ─────────────────────────────────
+
+    def _choose_attach_target(self, cell):
+        """Settle which ETABS to attach to, then re-enter _run_cell.
+
+        On the Tk thread, because the several-instances case has to ask.
+        """
+        procs = app_paths.running_etabs()
+
+        if not procs:
+            messagebox.showwarning(
+                "No ETABS running",
+                "No ETABS process is running on this machine.\n\n"
+                "Open ETABS and load your model, then press Attach again — "
+                "or press Launch to start ETABS from here.", parent=self)
+            self._log("Attach: no running ETABS found.", "warn")
+            return
+
+        readable = [p for p in procs if not p["access_denied"]]
+        if not readable:
+            self._elevation_blocked(procs)
+            return
+
+        if len(readable) == 1:
+            self._attach_to(cell, readable[0]["pid"], readable[0]["exe"])
+            return
+
+        self._probe_instances(cell, readable)
+
+    def _elevation_blocked(self, procs):
+        """We can see ETABS but not read it -- the classic privilege mismatch.
+
+        psutil can read an elevated process's name but not its exe path, so
+        AccessDenied here is a reliable signal that ETABS is running elevated
+        and we are not. COM cannot cross that boundary, and nothing about the
+        raw failure says so.
+        """
+        pids = ", ".join(str(p["pid"]) for p in procs)
+        messagebox.showerror(
+            "ETABS is running as administrator",
+            f"ETABS (PID {pids}) is running with administrator privileges, "
+            "but this app is not. Windows blocks connections between "
+            "programs at different privilege levels.\n\n"
+            "Either one of these fixes it:\n"
+            "  •  Close ETABS and reopen it normally (without 'Run as "
+            "administrator'), or\n"
+            "  •  Start this app as administrator too.", parent=self)
+        self._log(f"Attach blocked: ETABS (PID {pids}) is elevated and this "
+                  f"app is not.", "err")
+
+    def _probe_instances(self, cell, procs):
+        """Ask each running ETABS which model it has open, then let the user
+        pick. The COM calls have to happen on the worker thread."""
+        self._log(f"{len(procs)} ETABS instances running — reading their "
+                  f"models...", "info")
+
+        def job():
+            import comtypes.gen.ETABSv1
+            helper = NS["_etabs_helper"]()
+            found = []
+            for proc in procs:
+                label = ""
+                try:
+                    obj = helper.GetObjectProcess(
+                        "CSI.ETABS.API.ETABSObject", proc["pid"])
+                    if obj is not None:
+                        obj = obj.QueryInterface(comtypes.gen.ETABSv1.cOAPI)
+                        label = obj.SapModel.GetModelFilename() or ""
+                except Exception:
+                    label = ""      # listed by PID alone; not fatal
+                found.append((proc["pid"], label, proc["exe"]))
+            return found
+
+        def done(ok, payload, elapsed):
+            self._post(self._pick_instance, cell, ok, payload, procs)
+
+        self._worker.submit(job, done)
+
+    def _pick_instance(self, cell, ok, payload, procs):
+        if ok:
+            options = payload
+        else:
+            self._log(f"Could not read model names ({payload}); listing by "
+                      f"PID.", "warn")
+            options = [(p["pid"], "", p["exe"]) for p in procs]
+
+        choice = ChooseInstance(self, options).result
+        if choice is None:
+            self._log("Attach cancelled.", "warn")
+            return
+        self._attach_to(cell, choice[0], choice[1])
+
+    def _attach_to(self, cell, pid, exe=None):
+        NS["attach_pid"] = pid
+        # A running instance is the most trustworthy source there is for where
+        # ETABS lives, so attaching once teaches Launch the path for free.
+        if exe:
+            self._remember_etabs_path(exe)
+        self._run_cell(cell, "attach")
+
+    # ── Connect: where ETABS.exe lives ───────────────────────────────────────
+
+    def _confirm_etabs_path(self):
+        """True when Launch has a usable ETABS.exe, asking the user if not."""
+        if self._etabs_path and os.path.isfile(self._etabs_path):
+            return True
+
+        if self._etabs_path:
+            message = ("The saved ETABS location no longer exists:\n\n"
+                       f"{self._etabs_path}\n\n"
+                       "Would you like to locate ETABS.exe yourself?")
+        else:
+            message = ("ETABS could not be found automatically on this "
+                       "machine.\n\nWould you like to locate ETABS.exe "
+                       "yourself?")
+        if not messagebox.askyesno("Where is ETABS?", message, parent=self):
+            self._log("Launch cancelled — no ETABS location set.", "warn")
+            return False
+        return self._pick_etabs()
+
+    def _pick_etabs(self):
+        """File picker for ETABS.exe. True when a path was chosen."""
+        start = os.path.dirname(self._etabs_path) if self._etabs_path else ""
+        path = filedialog.askopenfilename(
+            parent=self, title="Locate ETABS.exe",
+            initialdir=start or None,
+            filetypes=[("ETABS program", "ETABS.exe"),
+                       ("Programs", "*.exe"),
+                       ("All files", "*.*")])
+        if not path:
+            return False
+        self._remember_etabs_path(path)
+        return True
+
+    def _remember_etabs_path(self, path):
+        if path and path != self._etabs_path:
+            self._etabs_path = path
+            app_paths.update_setting("etabs_path", path)
+            self._log(f"ETABS location saved: {path}", "ok")
+        self._refresh_etabs_label()
+
+    def _refresh_etabs_label(self):
+        label = getattr(self, "lbl_etabs", None)
+        if label is None:
+            return
+        if not self._etabs_path:
+            label.configure(text="ETABS not found — click Change…", fg=RED)
+        elif not os.path.isfile(self._etabs_path):
+            label.configure(text=f"Missing: {self._etabs_path}", fg=RED)
+        else:
+            folder = os.path.basename(os.path.dirname(self._etabs_path))
+            label.configure(text=folder or self._etabs_path, fg=FG_DIM)
+
+    # ── Connect: self-diagnosis ──────────────────────────────────────────────
+
+    def _diagnose(self):
+        """Everything needed to explain a failed connection, in one place.
+
+        Needs no ETABS connection, so it still works when nothing else does.
+        Ask a colleague for this before asking anything else.
+        """
+        import importlib.util
+        import platform
+
+        self._log("")
+        self._log("=" * 60, "info")
+        self._log("  CONNECTION DIAGNOSTICS", "info")
+        self._log("=" * 60, "info")
+
+        bits = 64 if sys.maxsize > 2 ** 32 else 32
+        elevated = app_paths.is_elevated()
+        self._log(f"  Windows      : {platform.platform()}")
+        self._log(f"  Python       : {platform.python_version()} ({bits}-bit)")
+        self._log(f"  Interpreter  : {sys.executable}")
+        self._log(f"  Running as   : {'administrator' if elevated else 'normal user'}")
+
+        self._log("")
+        for module in ("comtypes", "psutil", "pandas", "openpyxl", "ezdxf"):
+            found = importlib.util.find_spec(module) is not None
+            self._log(f"  {module:<12} : {'installed' if found else 'MISSING'}",
+                      None if found else "err")
+        generated = importlib.util.find_spec("comtypes.gen.ETABSv1") is not None
+        self._log(f"  {'ETABS API':<12} : "
+                  + ("type library ready" if generated
+                     else "not generated yet (happens on first connect)"),
+                  None if generated else "warn")
+
+        self._log("")
+        if self._etabs_path and os.path.isfile(self._etabs_path):
+            self._log(f"  ETABS.exe    : {self._etabs_path}", "ok")
+        elif self._etabs_path:
+            self._log(f"  ETABS.exe    : MISSING - {self._etabs_path}", "err")
+        else:
+            self._log("  ETABS.exe    : not found on this machine", "err")
+        for exe in app_paths.detect_etabs():
+            if str(exe) != self._etabs_path:
+                self._log(f"  also found   : {exe}")
+
+        self._log("")
+        procs = app_paths.running_etabs()
+        if not procs:
+            self._log("  Running ETABS: none", "warn")
+        for proc in procs:
+            if proc["access_denied"]:
+                self._log(f"  PID {proc['pid']:<8} : running as administrator "
+                          f"- this app cannot reach it", "err")
+            else:
+                self._log(f"  PID {proc['pid']:<8} : {proc['exe']}", "ok")
+        if procs and elevated is False and any(p["access_denied"] for p in procs):
+            self._log("")
+            self._log("  -> Reopen ETABS without 'Run as administrator', or "
+                      "start this app as administrator.", "warn")
+
+        self._log("")
+        self._log(f"  Settings     : {app_paths.settings_path()}")
+        self._log(f"  Logs         : {app_paths.logs_dir()}")
+        self._log("=" * 60, "info")
+
     # ── Cell execution ───────────────────────────────────────────────────────
 
     def _run_cell(self, cell, key):
+        # Both connect paths need a decision made on the Tk thread first --
+        # which ETABS to attach to, or where ETABS.exe lives -- because either
+        # may have to ask. Those helpers call back here once settled.
+        if key == "diagnose":
+            self._diagnose()
+            return
+        if key == "attach" and not NS.get("attach_pid"):
+            self._choose_attach_target(cell)
+            return
+        if key == "launch" and not self._confirm_etabs_path():
+            return
+
         code = CODE_BY_KEY[key]
         badge = self._badges[cell["id"]]
         buttons = [self._buttons[k] for _, k in cell["actions"]]
@@ -871,7 +1263,7 @@ class App(tk.Tk):
         self._log(f"  {cell['title']} -- {key}", "info")
         self._log("-" * 60, "info")
 
-        NS["etabs_path"] = DEFAULT_ETABS_PATH
+        NS["etabs_path"] = self._etabs_path
 
         def job():
             redirect = Redirect(lambda t: self._post(self._write, t))
@@ -1284,9 +1676,73 @@ class App(tk.Tk):
             messagebox.showerror(f"{what} failed", str(payload), parent=self)
 
 
-if __name__ == "__main__":
+def _preflight():
+    """Names of required packages that are not importable."""
+    import importlib.util
+    required = ("comtypes", "psutil", "pandas", "openpyxl")
+    return [m for m in required if importlib.util.find_spec(m) is None]
+
+
+def _show_error(title, text):
+    """Put text in front of the user without assuming Tk is usable.
+
+    Under pythonw.exe there is no console, so a failure that escapes this
+    function is a failure nobody ever sees.
+    """
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(title, text, parent=None)
+        root.destroy()
+        return
+    except Exception:
+        pass
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, text[:1500], title, 0x10)
+    except Exception:
+        pass
+
+
+def _write_crash_log(text):
+    """Append a timestamped report; returns the path, or "" if we could not."""
+    try:
+        import app_paths
+        if not app_paths.ensure_dir(app_paths.logs_dir()):
+            return ""
+        path = app_paths.logs_dir() / f"crash_{time.strftime('%Y%m%d_%H%M%S')}.log"
+        header = (f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                  f"python     : {sys.version}\n"
+                  f"executable : {sys.executable}\n"
+                  f"argv       : {sys.argv}\n"
+                  f"cwd        : {os.getcwd()}\n\n")
+        path.write_text(header + text, encoding="utf-8")
+        return str(path)
+    except Exception:
+        return ""
+
+
+def _fatal(exc_type, exc, tb):
+    text = "".join(traceback.format_exception(exc_type, exc, tb))
+    log_path = _write_crash_log(text)
+    tail = f"\n\nFull report:\n{log_path}" if log_path else ""
+    _show_error("ETABS Live Connector could not start",
+                f"{exc_type.__name__}: {exc}{tail}")
+
+
+def main():
     # Make sure `import fdr_tool` works no matter where the app is started from.
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+    missing = _preflight()
+    if missing:
+        _show_error(
+            "Missing Python packages",
+            "This app needs the following package(s), which are not installed:\n\n"
+            f"    {', '.join(missing)}\n\n"
+            "Install them by running:\n\n"
+            f'    "{sys.executable}" -m pip install -r requirements.txt')
+        return 1
 
     # --pid <N> is passed by the ETABS plugin (see etabs_plugin/) so this GUI
     # attaches to the exact instance that launched it, instead of guessing.
@@ -1310,3 +1766,14 @@ if __name__ == "__main__":
                 pass
 
     App().mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        _fatal(*sys.exc_info())
+        sys.exit(1)

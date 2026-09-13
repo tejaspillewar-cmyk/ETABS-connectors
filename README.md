@@ -177,7 +177,40 @@ So the buttons are not redundant:
 | | Use when |
 |---|---|
 | **Attach** | ETABS is already open. Normal path. Works on the model you are looking at. |
-| **Launch** | Nothing is open, *or* attach fails for environmental reasons. Guarantees you get ETABS 23 and not some other installed version. |
+| **Launch** | Nothing is open, *or* attach fails for environmental reasons. |
+| **Diagnose** | Nothing works and you need to know why. Prints the full environment — see below. |
+
+### How the connection resolves itself
+
+Attach never reads a configured path — it finds ETABS by process id. That has a useful
+consequence: **attaching once teaches the app where ETABS lives.** `psutil` reports the exact
+binary behind the process it connected to, which is saved and then used by Launch. So on most
+machines nothing ever needs configuring.
+
+The ETABS location is resolved in this order:
+
+1. A currently running ETABS (authoritative — it is the binary actually in use)
+2. The saved path from a previous run, if it still exists
+3. A scan of `Program Files\Computers and Structures\ETABS*\ETABS.exe`, newest first
+4. Otherwise the app asks, once, with a file picker
+
+Card 01 shows which install Launch will use, with a **Change…** link to correct it. The setting
+lives in `%LOCALAPPDATA%\ETABSLiveConnector\settings.json`.
+
+The scan checks for `ETABS.exe` itself rather than the versioned folder, because uninstalling
+ETABS can leave the folder behind containing only `CSiLicensing` — offering that hollow
+directory would be worse than finding nothing.
+
+### When several ETABS are open
+
+Attach lists them **by the model each has open**, not by process id, and asks which one you mean.
+
+### When ETABS is running as administrator
+
+COM cannot cross a privilege boundary, and the raw failure says nothing useful. The app detects
+this specifically: `psutil` can read an elevated process's name but not its executable path, so
+"visible but unreadable" is a reliable signature. You get told to either reopen ETABS normally
+or run the app elevated too, instead of a bare COM error.
 
 ### My take on this
 
@@ -199,14 +232,11 @@ door. Three observations on where it stands now:
    the app. It is a notebook kernel that cannot be accidentally restarted, cannot
    be used from the wrong thread, and does not freeze the UI. Good evolution.
 
-3. **The one weak spot left is the hardcoded path.** `DEFAULT_ETABS_PATH`
-   (`etabs_gui.pyw:81`) is a literal `...\ETABS 23\ETABS.exe` with no way to
-   change it from the UI — `_run_cell` just assigns it at line 874. On a machine
-   with ETABS installed elsewhere, or on ETABS 24, **Launch** fails with an error
-   that will not obviously point at the path. Since dodging the registry is the
-   entire point, the path is load-bearing and deserves to be a visible, editable
-   field (or a `Program Files` scan with a file-picker fallback). Attach is
-   unaffected — it never reads the path.
+3. **The hardcoded path was the last weak spot — now fixed.** It used to be a literal
+   `...\ETABS 23\ETABS.exe` with no way to change it, so Launch broke on any
+   machine with ETABS installed elsewhere. It is now resolved at runtime (see
+   "How the connection resolves itself" above) and remembered. Attach was never
+   affected, since it has never read the path.
 
 ---
 
@@ -214,9 +244,14 @@ door. Three observations on where it stands now:
 
 ```
 etabs_gui.pyw          Tk UI, cards, worker thread, FDR panel
+   ├── app_paths.py    settings, crash logs, ETABS discovery (no Tk, no deps)
    └── fdr_tool.py     FDRConfig + FDRTool: extraction, checks, exports
           └── ETABS COM (comtypes) ──> running ETABS.exe
 ```
+
+`app_paths.py` deliberately imports nothing beyond the standard library at module
+level, because the crash handler uses it before Tk is up and has to keep working on a
+machine where the dependencies were never installed.
 
 **Every ETABS call runs on one long-lived background thread.**
 
@@ -272,13 +307,15 @@ Re-run the script after an ETABS upgrade to refresh that copy.
 | Path | Role |
 |---|---|
 | `etabs_gui.pyw` | The application. Entry point. |
-| `fdr_tool.py` | All engineering logic and exporters. Its only local import. |
+| `fdr_tool.py` | All engineering logic and exporters. |
+| `app_paths.py` | Settings, crash-log location, and ETABS discovery. |
 | `requirements.txt` | Python dependencies. |
 | `etabs_plugin/` | Optional ETABS menu launcher (C#). |
 | `cad_export/` | Generated output. Not in version control, safe to delete. |
 
-To hand this tool to someone else, `etabs_gui.pyw` + `fdr_tool.py` +
-`requirements.txt` is the whole thing.
+To hand this tool to someone else, `etabs_gui.pyw` + `fdr_tool.py` + `app_paths.py` +
+`requirements.txt` is the whole thing. No paths need editing — the ETABS location is
+worked out on first run.
 
 ---
 
@@ -287,10 +324,12 @@ To hand this tool to someone else, `etabs_gui.pyw` + `fdr_tool.py` +
 | Symptom | Cause / fix |
 |---|---|
 | *"No running ETABS process found"* | ETABS is not open, or is running elevated while Python is not. Match their privilege levels. |
-| *"Several ETABS instances are running"* | Close the extras, or launch with `--pid <N>`. |
+| *"Several ETABS instances are running"* | No longer an error — Attach asks which model you mean. |
 | *"Attach failed. Is the model fully loaded?"* | ETABS was still opening the `.EDB`. Wait for it to finish, then retry. |
-| **Launch** fails or opens the wrong ETABS version | `DEFAULT_ETABS_PATH` (`etabs_gui.pyw:81`) is hardcoded to `...\ETABS 23\ETABS.exe`. Edit it to match your install. See §5. |
-| Attach fails but ETABS is clearly open | Privilege mismatch — COM cannot cross an elevation boundary. Run Python and ETABS both elevated, or both not. See §5. |
+| **Launch** fails or opens the wrong ETABS version | Use **Change…** on card 01 to point at the right `ETABS.exe`. The choice is remembered. |
+| Attach fails but ETABS is clearly open | Privilege mismatch — the app now detects this and says so. Reopen ETABS normally, or run the app elevated too. |
+| **Nothing happens when you double-click the app** | It no longer fails silently: you get a dialog, and a full report in `%LOCALAPPDATA%\ETABSLiveConnector\logs\`. |
+| Anything else connection-related | Press **Diagnose** on card 01 and send the output — it lists Python, packages, ETABS installs, and every running instance. |
 | Forces are all zero / empty results | The model has not been analysed. Run the analysis in ETABS first. |
 | 0.4·fck and 0.2·fck checks look wrong | Your wind keywords do not match this model's combination naming, so wind cases are leaking into the non-wind envelope. |
 | Blank Pt% / As on some piers | Expected — those piers are governed by `As_min`. Tick *Plot minimum-governed values* to show them. |
