@@ -1,0 +1,29 @@
+REGEDIT4
+
+[HKEY_CURRENT_USER\Software\Classes\cPlugin]
+@="cPlugin"
+
+[HKEY_CURRENT_USER\Software\Classes\cPlugin\CLSID]
+@="{E2613BBD-14C3-3D04-B906-FC47E6FCEFDD}"
+
+[HKEY_CURRENT_USER\Software\Classes\CLSID\{E2613BBD-14C3-3D04-B906-FC47E6FCEFDD}]
+@="cPlugin"
+
+[HKEY_CURRENT_USER\Software\Classes\CLSID\{E2613BBD-14C3-3D04-B906-FC47E6FCEFDD}\InprocServer32]
+@="mscoree.dll"
+"ThreadingModel"="Both"
+"Class"="cPlugin"
+"Assembly"="EtabsGuiPlugin, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+"RuntimeVersion"="v4.0.30319"
+"CodeBase"="file:///d:/Data/ET/experiments/ETABS Connector/etabs_plugin/EtabsGuiPlugin.dll"
+
+[HKEY_CURRENT_USER\Software\Classes\CLSID\{E2613BBD-14C3-3D04-B906-FC47E6FCEFDD}\InprocServer32\0.0.0.0]
+"Class"="cPlugin"
+"Assembly"="EtabsGuiPlugin, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+"RuntimeVersion"="v4.0.30319"
+"CodeBase"="file:///d:/Data/ET/experiments/ETABS Connector/etabs_plugin/EtabsGuiPlugin.dll"
+
+[HKEY_CURRENT_USER\Software\Classes\CLSID\{E2613BBD-14C3-3D04-B906-FC47E6FCEFDD}\ProgId]
+@="cPlugin"
+
+[HKEY_CURRENT_USER\Software\Classes\CLSID\{E2613BBD-14C3-3D04-B906-FC47E6FCEFDD}\Implemented Categories\{62C8FE65-4EBB-45E7-B440-6E39B2CDBF29}]

@@ -1,0 +1,69 @@
+================================================================================
+                    ETABS LIVE CONNECTOR - SETUP INSTRUCTIONS
+================================================================================
+
+This folder contains the ETABS Live Connector tool. It has been designed to be 
+fully portable, meaning you can place this folder anywhere on your computer. 
+You do NOT need administrator privileges to set it up or run it.
+
+Please follow these steps carefully to install and use the tool.
+
+--------------------------------------------------------------------------------
+STEP 1: INSTALL PYTHON (If you don't already have it)
+--------------------------------------------------------------------------------
+1. Go to https://www.python.org/downloads/
+2. Click the "Download Python" button.
+3. Run the downloaded installer.
+4. ***CRITICAL STEP***: At the very bottom of the first installation screen, 
+   make sure you check the box that says "Add Python to PATH".
+5. Click "Install Now" (or "Install for this user only" if you don't have 
+   admin rights).
+
+--------------------------------------------------------------------------------
+STEP 2: RUN THE AUTOMATED SETUP SCRIPT
+--------------------------------------------------------------------------------
+You only need to do this step ONCE on your computer.
+
+1. Open the "ETABS Connector" folder that contains these instructions.
+2. Find the file named "setup.bat".
+3. Double-click "setup.bat" to run it.
+4. A black command window will open. It will automatically create a local 
+   environment and download the necessary background files (pandas, openpyxl, etc).
+5. Wait for it to say "Setup complete!". Press any key to close the window.
+
+--------------------------------------------------------------------------------
+STEP 3: REGISTER THE PLUGIN IN ETABS
+--------------------------------------------------------------------------------
+You only need to do this step ONCE. ETABS will remember it forever.
+
+setup.bat already did this for you in Step 2 -- it registers the plugin as a
+COM component and adds a "Live Connector" entry to ETABS's own menu config
+(ETABS.ini), so it shows up automatically. You do NOT need to add it manually
+through "Tools > Add/Show Plugins...".
+
+If it doesn't appear in the Tools menu, close ETABS completely and reopen it
+(ETABS reads its plugin list once at startup), then re-run setup.bat.
+
+--------------------------------------------------------------------------------
+STEP 4: USING THE TOOL
+--------------------------------------------------------------------------------
+Whenever you want to use the tool:
+
+1. Open your model in ETABS.
+2. Go to "Tools" in the top menu.
+3. You will see "Live Connector" (or whatever you named it in Step 3) at the 
+   bottom of the Tools menu. Click it!
+4. The control panel GUI will launch and automatically connect to your open 
+   ETABS model.
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+- If you run setup.bat and it says "Python is not installed", please repeat 
+  Step 1 and ensure you check the "Add Python to PATH" box.
+- If you move the "ETABS Connector" folder to a different location on your PC
+  later, re-run setup.bat so it can re-register the plugin at its new path.
+- If you see an error message pop up in ETABS when you click "Live Connector"
+  ("etabs_gui.pyw not found..." or "pythonw.exe not found..."), it means
+  etabs_plugin\plugin.config is missing or has stale paths -- re-run setup.bat
+  to regenerate it, or edit that file by hand.

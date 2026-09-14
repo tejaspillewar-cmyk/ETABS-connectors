@@ -615,26 +615,37 @@ class App(tk.Tk):
         self._bind_scroll(canvas)
 
     def _bind_scroll(self, canvas):
-        """Bind the wheel directly on every widget in the scroll area.
+        """Global wheel binding that scrolls the canvas from anywhere over it.
 
-        A single canvas.bind_all() looked like the standard recipe, but on
-        this app it silently did nothing except over the scrollbar itself --
-        wheel events were reaching the child labels/frames first and going
-        nowhere. Binding on each widget explicitly is what actually works.
+        bind_all captures every MouseWheel event application-wide; the handler
+        checks whether the event widget lives inside the canvas before acting,
+        so the console and combo-box list keep their own scroll behaviour.
         """
+        self._scroll_canvas = canvas
+
+        def _is_descendant(widget, ancestor):
+            """Walk up the widget tree to check parentage."""
+            try:
+                w = widget
+                while w is not None:
+                    if w is ancestor:
+                        return True
+                    w = w.master
+            except Exception:
+                pass
+            return False
+
         def on_wheel(e):
-            # The combo list and the console scroll themselves; leave them be.
-            if isinstance(e.widget, (tk.Listbox, tk.Text)):
+            w = e.widget
+            # Widgets that scroll themselves: leave them alone.
+            if isinstance(w, (tk.Listbox, tk.Text)):
+                return
+            # Only scroll when the pointer is over the canvas / its children.
+            if not (_is_descendant(w, canvas) or w is canvas):
                 return
             canvas.yview_scroll(-1 * int(e.delta / 120), "units")
 
-        def bind_tree(widget):
-            widget.bind("<MouseWheel>", on_wheel, add="+")
-            for child in widget.winfo_children():
-                bind_tree(child)
-
-        canvas.bind("<MouseWheel>", on_wheel, add="+")
-        bind_tree(self._scroll)
+        canvas.bind_all("<MouseWheel>", on_wheel, add="+")
 
     # ── Cards ────────────────────────────────────────────────────────────────
 
@@ -657,46 +668,36 @@ class App(tk.Tk):
         self._card(grid, 0, CELLS[0])
         self._stacked_pair(grid, 1, CELLS[1], CELLS[2])
         self._fdr_card(grid, 2)
-        self._pier_section()
 
-    def _pier_section(self):
-        self._section_header(self._scroll, "Pier Labels",
-                             "Rebuild pier labels from the wall geometry")
-
-        border = tk.Frame(self._scroll, bg=BORDER, padx=1, pady=1)
-        border.pack(fill="x", padx=24, pady=(0, 24))
+    def _pier_mini_card(self, parent, row):
+        """Compact pier-relabel card for the stacked column."""
+        border = tk.Frame(parent, bg=BORDER, padx=1, pady=1)
+        border.grid(row=row, column=0, sticky="nsew", pady=(8, 0))
         card = tk.Frame(border, bg=SURFACE)
         card.pack(fill="both", expand=True)
         tk.Frame(card, bg=AMBER, height=3).pack(fill="x")
 
         body = tk.Frame(card, bg=SURFACE)
-        body.pack(fill="both", expand=True, padx=16, pady=12)
+        body.pack(fill="both", expand=True, padx=14, pady=10)
 
-        tk.Label(body, text="Renumber piers from geometry", font=self.f_title,
-                 fg=FG, bg=SURFACE, anchor="w").pack(fill="x")
+        top = tk.Frame(body, bg=SURFACE)
+        top.pack(fill="x")
+        tk.Label(top, text="Pier Labels", font=self.f_title, fg=FG,
+                 bg=SURFACE).pack(side="left")
+
         tk.Label(body,
-                 text="Walls stacked at the same plan position share one "
-                      "label; two piers on a storey never do.",
+                 text="Rebuild pier labels from wall geometry",
                  font=self.f_sub, fg=AMBER, bg=SURFACE, anchor="w",
-                 justify="left").pack(fill="x")
-        tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=9)
-        tk.Label(body,
-                 text="Openings need no special handling: the pieces of a "
-                      "pierced wall sit over the same plan run, so they group "
-                      "together on their own. Preview reports what would "
-                      "change without touching the model. The model must be "
-                      "unlocked to apply, so relabel before running analysis.",
-                 font=self.f_detail, fg=FG_DIM, bg=SURFACE, anchor="w",
-                 justify="left", wraplength=880).pack(fill="x")
-        tk.Frame(body, bg=SURFACE, height=10).pack()
+                 justify="left", wraplength=260).pack(fill="x", pady=(4, 8))
 
-        row = tk.Frame(body, bg=SURFACE)
-        row.pack(fill="x")
+        row_btns = tk.Frame(body, bg=SURFACE)
+        row_btns.pack(fill="x")
         for i, (text, key, accent, cmd) in enumerate((
                 ("Preview", "pier_preview", AMBER, self._relabel_preview),
                 ("Apply", "pier_apply", RED, self._relabel_apply))):
-            btn = self._flat_button(row, text, accent, cmd)
-            btn.pack(side="left", padx=(0 if i == 0 else 8, 0))
+            btn = self._flat_button(row_btns, text, accent, cmd, small=True)
+            btn.pack(side="left", expand=True, fill="x",
+                     padx=(0 if i == 0 else 6, 0))
             self._buttons[key] = btn
 
     def _card(self, parent, col, cell):
@@ -767,12 +768,13 @@ class App(tk.Tk):
         self._refresh_etabs_label()
 
     def _stacked_pair(self, parent, col, cell_top, cell_bottom):
-        """Two compact cards stacked in one grid column, e.g. cards 02+03."""
+        """Compact cards stacked in one grid column: 02, 03, and pier relabel."""
         wrap = tk.Frame(parent, bg=BG)
         wrap.grid(row=0, column=col, padx=(8, 0), sticky="nsew")
         wrap.columnconfigure(0, weight=1)
         self._mini_card(wrap, 0, cell_top)
         self._mini_card(wrap, 1, cell_bottom)
+        self._pier_mini_card(wrap, 2)
 
     def _mini_card(self, parent, row, cell):
         """A compact variant of _card for the stacked column."""
@@ -902,12 +904,14 @@ class App(tk.Tk):
 
         tk.Label(body, text="Text stack offsets (mm)", font=self.f_badge,
                  fg=FG_DIM, bg=SURFACE, anchor="w").pack(fill="x", pady=(0, 4))
-        self._field(body, "Pier-to-text gap", self.var_offset_pier).pack(
-            fill="x", pady=(0, 6))
-        self._field(body, "Label-to-Pt% spacing", self.var_offset_pt).pack(
-            fill="x", pady=(0, 6))
-        self._field(body, "Pt%-to-As spacing", self.var_offset_as).pack(
-            fill="x", pady=(0, 6))
+        offsets_row = tk.Frame(body, bg=SURFACE)
+        offsets_row.pack(fill="x", pady=(0, 6))
+        self._field(offsets_row, "Pier gap", self.var_offset_pier, width=6).pack(
+            side="left", fill="x", expand=True)
+        self._field(offsets_row, "Label→Pt%", self.var_offset_pt, width=6).pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
+        self._field(offsets_row, "Pt%→As", self.var_offset_as, width=6).pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
         tk.Label(body,
                  text="Stack (bottom to top): Pier label, Required Pt%, "
                       "As Required.",
@@ -918,13 +922,12 @@ class App(tk.Tk):
         self.var_show_percent = tk.BooleanVar(value=True)
         self.var_plot_min_values = tk.BooleanVar(value=True)
 
-        self._checkbox(body, "Show \"%\" symbol on Required Pt% text",
-                       self.var_show_percent).pack(anchor="w")
-        self._checkbox(
-            body,
-            "Plot values for minimum-governed piers",
-            self.var_plot_min_values
-        ).pack(anchor="w", pady=(2, 10))
+        chk_row = tk.Frame(body, bg=SURFACE)
+        chk_row.pack(fill="x", pady=(0, 10))
+        self._checkbox(chk_row, "Show \"%\" symbol",
+                       self.var_show_percent).pack(side="left")
+        self._checkbox(chk_row, "Plot min-governed",
+                       self.var_plot_min_values).pack(side="left", padx=(12, 0))
 
         # -- Story + refresh ---------------------------------------------------
         tk.Label(body, text="Story", font=self.f_badge, fg=FG_DIM,

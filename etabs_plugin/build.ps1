@@ -20,9 +20,15 @@ if (-not (Test-Path $etabsDll)) {
     throw "ETABSv1.dll not found at $etabsDll -- edit build.ps1 `$etabsInstall to match your ETABS install."
 }
 
+# Reference the real ETABSv1.dll directly (not a stand-in). ETABS's own
+# ".NET plugin" loader finds our cPlugin class by scanning the assembly's
+# types for one assignable to *its own* ETABSv1.cPluginContract type via
+# plain reflection -- it does not go through COM, so a locally-embedded
+# copy of the interface (even with matching GUIDs) is never recognized as
+# the same type and the loader ends up with a null type to instantiate.
 $fx = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319"
 $src = Join-Path $PSScriptRoot "EtabsGuiPlugin.cs"
-$out = Join-Path $PSScriptRoot "EtabsGuiPlugin.dll"
+$out = Join-Path $PSScriptRoot "EtabsLiveConnector.dll"
 
 & $csc `
     /nologo /target:library /platform:x64 /out:$out `
@@ -36,17 +42,6 @@ if ($LASTEXITCODE -ne 0) {
     throw "Build failed."
 }
 
-# ETABS hosts plugins on .NET 8, which resolves a plugin's dependencies
-# relative to the plugin's own folder rather than ETABS's install folder or
-# the GAC. CSI's docs say not to ship ETABSv1.dll alongside a *public*
-# plugin (to avoid a stale copy lingering after an ETABS upgrade), but
-# without admin rights `RegisterETABS.exe` can't register it system-wide,
-# and this in-house plugin only ever runs on this machine -- so we copy the
-# exact same-version DLL from the install folder on every build instead.
-# If ETABS is upgraded, just re-run this script to refresh the copy.
-Copy-Item $etabsDll (Join-Path $PSScriptRoot "ETABSv1.dll") -Force
-
 Write-Output ""
 Write-Output "Built: $out"
 Write-Output "In ETABS: Tools > Add/Show Plugins > browse to this DLL > Add."
-Write-Output "Edit plugin.config first if your python env or script path differ."

@@ -266,6 +266,10 @@ def cluster_story(walls: list) -> list:
 
 def build_stacks(walls: list, story_order: list, log=lambda m: None):
     """Cluster each storey, then chain clusters vertically into stacks.
+    
+    Identifies the storey with the maximum number of piers to establish the base 
+    set of labels, then propagates matching up and down to ensure continuous 
+    vertical stacks reuse the same label.
 
     Returns (clusters_by_story, stacks) where a stack is a list of clusters
     from different storeys sharing a plan position.
@@ -279,29 +283,65 @@ def build_stacks(walls: list, story_order: list, log=lambda m: None):
         if by_story.get(story):
             clusters_by_story[story] = cluster_story(by_story[story])
 
+    if not clusters_by_story:
+        return clusters_by_story, []
+
+    # 1. Identify the story with the maximum number of clusters
+    base_story = max(clusters_by_story.keys(), key=lambda s: len(clusters_by_story[s]))
+    log(f"  base storey for labels: {base_story} with {len(clusters_by_story[base_story])} piers")
+
     stacks = []
-    previous = []
-    for story in story_order:
-        current = clusters_by_story.get(story)
-        if not current:
-            continue
-        claimed = set()
-        for cl in sorted(current, key=lambda c: -c.extent):
-            best, best_ov = None, STACK_MIN_OVERLAP_MM
-            for k, prev in enumerate(previous):
-                if k in claimed:
-                    continue           # one stack takes at most one cluster
-                ov = cl.overlap_with(prev)
-                if ov > best_ov:
-                    best, best_ov = k, ov
-            if best is None:
-                stacks.append([cl])
-                cl.stack = len(stacks) - 1
-            else:
-                claimed.add(best)
-                stacks[previous[best].stack].append(cl)
-                cl.stack = previous[best].stack
-        previous = current
+    
+    # 2. Establish the complete set of pier labels from the base story
+    for cl in clusters_by_story[base_story]:
+        stacks.append([cl])
+        cl.stack = len(stacks) - 1
+
+    # Split stories into those above base_story and those below
+    base_idx = story_order.index(base_story)
+    stories_above = story_order[base_idx + 1:]
+    stories_below = reversed(story_order[:base_idx])
+
+    def propagate(stories):
+        for story in stories:
+            current = clusters_by_story.get(story)
+            if not current:
+                continue
+            
+            # Compute overlaps between all current clusters and all established stacks
+            matches = []
+            for i, cl in enumerate(current):
+                for j, stack in enumerate(stacks):
+                    # Max overlap with any cluster already in the stack
+                    ov = max((cl.overlap_with(c) for c in stack), default=0.0)
+                    if ov > STACK_MIN_OVERLAP_MM:
+                        matches.append((ov, i, j))
+            
+            # Sort by overlap descending to greedily match the best overlaps first
+            matches.sort(key=lambda x: x[0], reverse=True)
+            
+            claimed_clusters = set()
+            claimed_stacks = set()
+            
+            for ov, i, j in matches:
+                # A cluster goes to at most one stack, and a stack takes at most one cluster
+                if i in claimed_clusters or j in claimed_stacks:
+                    continue
+                stacks[j].append(current[i])
+                current[i].stack = j
+                claimed_clusters.add(i)
+                claimed_stacks.add(j)
+                
+            # For any cluster that didn't find a stack, create a new one
+            for i, cl in enumerate(current):
+                if i not in claimed_clusters:
+                    stacks.append([cl])
+                    cl.stack = len(stacks) - 1
+
+    # 3. Propagate up and down to match clusters into the vertical stacks
+    propagate(stories_above)
+    propagate(stories_below)
+
     log(f"  {sum(len(v) for v in clusters_by_story.values())} piers "
         f"across {len(clusters_by_story)} storeys -> {len(stacks)} stacks")
     return clusters_by_story, stacks
