@@ -70,7 +70,8 @@ python etabs_gui.pyw
 **From inside ETABS** (optional, see §7): *Tools → Add/Show Plugins*.
 
 The app can also be started with `--pid <N>` to attach to one specific ETABS
-process. That is how the plugin launches it; you rarely need to type it.
+process, for scripted launches that know the target PID. The plugin (§7)
+doesn't use this — it just opens the GUI and you Attach from card 01.
 
 ---
 
@@ -280,25 +281,41 @@ not scattered through the calculation code.
 
 ## 7. The ETABS plugin (optional)
 
-`etabs_plugin/` is a small C# shim that adds this tool to ETABS's plugin menu and
-launches the GUI already attached to that exact instance.
+`PyLauncherPlugin/` is a small VB shim that adds this tool to ETABS's plugin
+menu. It resolves `etabs_gui.pyw` one directory up from its own DLL at
+runtime, so nothing needs editing or building.
 
 The GUI works perfectly well without it — this is a convenience, not a dependency.
 
-**To build and install:**
+**To install:**
 
-1. Edit `plugin.config` — it contains **absolute paths** to `pythonw.exe` and
-   `etabs_gui.pyw` that are almost certainly wrong on another machine.
-2. Run `build.ps1` (uses the C# compiler bundled with .NET Framework 4 — no
-   Visual Studio needed).
-3. In ETABS: *Tools → Add/Show Plugins →* browse to `EtabsGuiPlugin.dll` → Add.
+1. In ETABS: *Tools → Add/Show Plugins → Add* → browse to
+   `PyLauncherPlugin\PyLauncherPlugin.dll` in this folder.
+2. Click "Live Connector" (or whatever you named it) at the bottom of the
+   Tools menu whenever you want to launch the GUI.
 
-`build.ps1` copies `ETABSv1.dll` out of your ETABS install folder because the
-.NET 8 plugin host resolves dependencies relative to the plugin's own directory.
-Re-run the script after an ETABS upgrade to refresh that copy.
+### Why this replaced the earlier `etabs_plugin`
 
-> **Do not redistribute `ETABSv1.dll`** — it is CSI's, and a stale copy will break
-> against a newer ETABS.
+An earlier version of the plugin (`etabs_plugin/`, since removed) chained
+three separate steps: hand-compile a C# DLL with `build.ps1`, COM-register it
+with `regasm`, then have a Python script (`register_etabs.py`) hand-edit
+ETABS's own `ETABS.ini` to add the menu entry. All three were unnecessary
+complexity, and the last one was actively broken:
+
+- COM registration never did anything useful — ETABS's ".NET plugin" loader
+  finds the plugin class by reflection, not COM, so that whole step was dead
+  weight.
+- ETABS rewrites `ETABS.ini` itself on exit, and silently drops `[PlugIn]`
+  entries that weren't added through its own *Add/Show Plugins* dialog. The
+  script-inserted entry didn't survive an ETABS restart, so the menu item
+  would randomly vanish.
+- The registry/DLL names the two registration paths produced drifted apart
+  over time (stale filenames, mismatched CLSIDs), which is exactly the kind
+  of thing that's invisible until the plugin silently stops loading.
+
+`PyLauncherPlugin` needs none of that: it's added once through ETABS's own
+dialog — the one path ETABS actually persists reliably — and has no config
+file or build step to go stale.
 
 ---
 
@@ -310,7 +327,7 @@ Re-run the script after an ETABS upgrade to refresh that copy.
 | `fdr_tool.py` | All engineering logic and exporters. |
 | `app_paths.py` | Settings, crash-log location, and ETABS discovery. |
 | `requirements.txt` | Python dependencies. |
-| `etabs_plugin/` | Optional ETABS menu launcher (C#). |
+| `PyLauncherPlugin/` | Optional ETABS menu launcher (VB), added manually via Tools → Add/Show Plugins. |
 | `cad_export/` | Generated output. Not in version control, safe to delete. |
 
 To hand this tool to someone else, `etabs_gui.pyw` + `fdr_tool.py` + `app_paths.py` +

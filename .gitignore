@@ -8,4 +8,3 @@ __pycache__/
 *.$ET
 *.e2k
 *.log
-etabs_plugin/*.dll

@@ -36,13 +36,17 @@ STEP 3: REGISTER THE PLUGIN IN ETABS
 --------------------------------------------------------------------------------
 You only need to do this step ONCE. ETABS will remember it forever.
 
-setup.bat already did this for you in Step 2 -- it registers the plugin as a
-COM component and adds a "Live Connector" entry to ETABS's own menu config
-(ETABS.ini), so it shows up automatically. You do NOT need to add it manually
-through "Tools > Add/Show Plugins...".
+1. Open ETABS.
+2. Go to Tools > Add/Show Plugins > Add.
+3. Browse to the "PyLauncherPlugin" folder inside "ETABS Connector" and select
+   PyLauncherPlugin.dll.
+4. Click Add.
 
-If it doesn't appear in the Tools menu, close ETABS completely and reopen it
-(ETABS reads its plugin list once at startup), then re-run setup.bat.
+This has to be done through ETABS's own dialog -- an earlier version of this
+tool tried to script this step by editing ETABS.ini directly, but ETABS
+regenerates that file on its own and silently drops entries that were not
+added through "Add/Show Plugins", so the shortcut kept disappearing. Adding it
+through the dialog is what makes it stick.
 
 --------------------------------------------------------------------------------
 STEP 4: USING THE TOOL
@@ -62,8 +66,9 @@ TROUBLESHOOTING
 - If you run setup.bat and it says "Python is not installed", please repeat 
   Step 1 and ensure you check the "Add Python to PATH" box.
 - If you move the "ETABS Connector" folder to a different location on your PC
-  later, re-run setup.bat so it can re-register the plugin at its new path.
+  later, remove the old entry in Tools > Add/Show Plugins and re-add it by
+  browsing to PyLauncherPlugin.dll at its new location.
 - If you see an error message pop up in ETABS when you click "Live Connector"
-  ("etabs_gui.pyw not found..." or "pythonw.exe not found..."), it means
-  etabs_plugin\plugin.config is missing or has stale paths -- re-run setup.bat
-  to regenerate it, or edit that file by hand.
+  saying it could not find etabs_gui.pyw, it means the PyLauncherPlugin folder
+  was moved out from beside etabs_gui.pyw -- keep them in the same "ETABS
+  Connector" folder (PyLauncherPlugin looks one directory up for the script).

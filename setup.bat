@@ -59,52 +59,20 @@ if errorlevel 1 (
 )
 
 echo.
-echo  Writing plugin.config...
-set "CONFIG_PATH=%ROOT%\etabs_plugin\plugin.config"
-(
-    echo # Paths used by EtabsGuiPlugin.dll. Edit these if the project or the
-    echo # python environment moves. Lines starting with # are ignored.
-    echo PYTHONW=%VENV%\Scripts\pythonw.exe
-    echo SCRIPT=%ROOT%\etabs_gui.pyw
-) > "%CONFIG_PATH%"
-echo  Wrote: %CONFIG_PATH%
-
-echo.
-echo  Registering Plugin as a COM component for the current user...
-set "FX_PATH=C:\Windows\Microsoft.NET\Framework64\v4.0.30319"
-set "DLL_PATH=%ROOT%\etabs_plugin\EtabsLiveConnector.dll"
-set "REG_PATH=%ROOT%\plugin_temp.reg"
-
-if exist "%FX_PATH%\regasm.exe" (
-    "%FX_PATH%\regasm.exe" /regfile:"%REG_PATH%" "%DLL_PATH%" /codebase >nul 2>&1
-    if exist "%REG_PATH%" (
-        powershell -Command "(Get-Content '%REG_PATH%') -replace 'HKEY_CLASSES_ROOT', 'HKEY_CURRENT_USER\Software\Classes' | Set-Content '%REG_PATH%'"
-        reg import "%REG_PATH%" >nul 2>&1
-        del "%REG_PATH%"
-        echo  COM registration successful.
-    ) else (
-        echo  Warning: Failed to generate COM registry file.
-    )
-) else (
-    echo  Warning: .NET Framework regasm.exe not found. COM registration skipped.
-)
-
-echo.
-echo  Configuring ETABS Menu...
-"%VENV%\Scripts\python.exe" "%ROOT%\etabs_plugin\register_etabs.py"
-
-echo.
 echo  ============================================================
 echo   Setup complete!
 echo  ============================================================
 echo.
-echo  The plugin "Live Connector" has been automatically added to ETABS!
+echo  Python environment ready. One manual step left to add the ETABS
+echo  menu shortcut (this cannot be automated -- see README.md section 7
+echo  for why):
 echo.
-echo  To use it:
-echo    1. Open ETABS
-echo    2. Go to the Tools menu.
-echo    3. Click "Live Connector" at the bottom of the list.
+echo    1. Open ETABS.
+echo    2. Tools -^> Add/Show Plugins -^> Add.
+echo    3. Browse to: %ROOT%\PyLauncherPlugin\PyLauncherPlugin.dll
+echo    4. Click "Live Connector" (or whatever you named it) in the
+echo       Tools menu whenever you want to use the tool.
 echo.
-echo  You do NOT need to add it manually in Add/Show Plugins.
+echo  You can also just run: pythonw etabs_gui.pyw
 echo.
 pause

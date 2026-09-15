@@ -1954,8 +1954,10 @@ def main():
             f'    "{sys.executable}" -m pip install -r requirements.txt')
         return 1
 
-    # --pid <N> is passed by the ETABS plugin (see etabs_plugin/) so this GUI
-    # attaches to the exact instance that launched it, instead of guessing.
+    # --pid <N> lets a launcher attach this GUI to one specific ETABS instance
+    # instead of guessing. PyLauncherPlugin doesn't pass it today, but the
+    # flag is kept for anyone launching the GUI from a script that knows the
+    # target PID.
     if "--pid" in sys.argv:
         try:
             NS["attach_pid"] = int(sys.argv[sys.argv.index("--pid") + 1])
