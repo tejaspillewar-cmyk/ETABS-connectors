@@ -128,8 +128,8 @@ NS["_etabs_helper"] = _etabs_helper
 # ═════════════════════════════════════════════════════════════════════════════
 
 LAUNCH_CODE = (
-    "import comtypes.gen.ETABSv1\n"
     "helper = _etabs_helper()\n"
+    "import comtypes.gen.ETABSv1\n"
     "print('Launching ETABS from:', etabs_path)\n"
     "myETABSObject = helper.CreateObject(etabs_path)\n"
     "myETABSObject.ApplicationStart()\n"
@@ -141,18 +141,17 @@ LAUNCH_CODE = (
 # The PID is always chosen before this runs -- see App._attach_pid_then_run,
 # which handles the none/one/several cases on the Tk thread so it can ask.
 ATTACH_CODE = (
-    "import comtypes.gen.ETABSv1\n"
     "pid = globals().pop('attach_pid', None)\n"
     "if not pid:\n"
     "    raise RuntimeError('No ETABS instance was selected.')\n"
     "print('Attaching to ETABS PID', pid)\n"
     "helper = _etabs_helper()\n"
+    "import comtypes.gen.ETABSv1\n"
     "myETABSObject = helper.GetObjectProcess('CSI.ETABS.API.ETABSObject', pid)\n"
     "if myETABSObject is None:\n"
     "    raise RuntimeError(\n"
     "        'ETABS refused the connection (PID ' + str(pid) + ').\\n\\n'\n"
-    "        'Most often the model is still loading -- wait for ETABS to finish "
-    "opening it and try again.')\n"
+    "        'Most often the model is still loading -- wait for ETABS to finish opening it and try again.')\n"
     "myETABSObject = myETABSObject.QueryInterface(comtypes.gen.ETABSv1.cOAPI)\n"
     "SapModel = myETABSObject.SapModel\n"
     "print('Attached. Active file:', SapModel.GetModelFilename() or '(none)')"
