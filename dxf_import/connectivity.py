@@ -148,7 +148,7 @@ class _StructuralGraph:
             d = distance(pt, (nx, ny))
             tol = self._snap_tolerance(element_width, 300)  # column width ~300mm typical
             if d <= tol:
-                node[3].add((element_type, element_ref))
+                node[3].add((element_type, element_id))
                 return nid, (nx, ny)
         
         # 2. Try other nodes (member endpoints)
@@ -156,13 +156,13 @@ class _StructuralGraph:
         if best_node:
             nid = best_node[2]
             snapped = (best_node[0], best_node[1])
-            best_node[3].add((element_type, element_ref))
+            best_node[3].add((element_type, element_id))
             return nid, snapped
         
         # 3. Create new node
         nid = self._next_node_id
         self._next_node_id += 1
-        self.nodes.append([pt[0], pt[1], nid, {(element_type, element_ref)}])
+        self.nodes.append([pt[0], pt[1], nid, {(element_type, element_id)}])
         return nid, pt
     
     def add_member(self, element_type, element_ref, p1, p2, half_width, angle_deg, element_id):
