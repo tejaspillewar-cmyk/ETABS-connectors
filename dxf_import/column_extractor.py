@@ -93,6 +93,15 @@ def extract_columns(msp, column_layers: list[str], scale: float = 1.0) -> list[C
             geom_width = round(rect["width"] / 5.0) * 5
             geom_depth = round(rect["length"] / 5.0) * 5
 
+        # Find nearest text label
+        best_idx, best_dist = -1, float("inf")
+        for idx, txt in enumerate(label_texts):
+            if idx in used_labels:
+                continue
+            d = distance((cx, cy), txt["position"])
+            if d < best_dist:
+                best_dist, best_idx = d, idx
+
         counter += 1
         if best_idx != -1 and best_dist <= MAX_LABEL_DISTANCE_MM:
             used_labels.add(best_idx)
