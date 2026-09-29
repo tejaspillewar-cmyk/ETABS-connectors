@@ -1,17 +1,21 @@
 """
 DXF -> ETABS Model Builder.
 
-Standalone PySide6 app (kept separate from etabs_gui.pyw / study_sheet.pyw
-because it embeds ezdxf's Qt-based CADViewer, which can't share a window
-with Tkinter). Reads a DXF floorplan, lets the user confirm which layers
-hold which element type, extracts walls/slabs/beams/columns with their
-dimensions, shows an interactive reference plan plus a classified summary,
-and -- once attached to a live ETABS instance -- draws the confirmed
-elements into the model as real objects with generated sections.
+Standalone PySide6 app. Reads a DXF floorplan, lets the user confirm which layers
+hold which element type, extracts walls/slabs/beams/columns with their dimensions,
+shows an interactive reference plan plus a classified summary, and draws the
+confirmed elements into a live ETABS instance as real objects with generated sections.
 
-Launched with --pid <N> (normally by the "DXF Model Builder" card in
-etabs_gui.pyw, which is already attached to that PID) to auto-attach to the
-same running ETABS instance on startup, instead of connecting separately.
+Workflow:
+  1. Load DXF & classify layers (auto + user confirmation)
+  2. Extract geometry (slabs, walls, beams, columns) at correct scale
+  3. Post-process: snap connections, deduplicate, compute origin offset
+  4. Preview results in summary table & CAD viewer
+  5. Draw directly into ETABS (primary action)
+  6. Optional: Export clean centerline DXF for manual review/editing
+  7. Optional: Import a previously exported clean DXF and draw that
+
+Launched with --pid <N> to auto-attach to a running ETABS instance.
 """
 import os
 import sys
@@ -35,81 +39,78 @@ from dxf_import.clean_dxf_importer import parse_clean_dxf
 
 import etabs_worker
 
-DEFAULT_FCK = "30"  # matches etabs_gui.pyw's DEFAULT_FCK, N/mm^2
+DEFAULT_FCK = "30"  # N/mm^2
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Dark stylesheet -- applied at the QApplication level (see main()) so it
-# reaches every top-level widget this app creates, including QDialog,
-# QMessageBox and QInputDialog, not just the main window's own children.
-# The base QWidget rule sets BOTH background-color and text color so nothing
-# falls back to the OS light/dark theme (which is what caused white text on
-# a white background when Windows was in light mode).
+# Dark stylesheet (matches #121824 theme)
 # ──────────────────────────────────────────────────────────────────────────
 DARK_STYLESHEET = """
     QWidget {
-        background-color: #1e272c; color: #eceff1;
+        background-color: #121824; color: #eceff1;
         font-family: "Segoe UI", Arial, sans-serif; font-size: 13px;
     }
-    QMainWindow { background-color: #1e272c; }
-    QSplitter::handle { background-color: #2c3b42; width: 2px; }
+    QMainWindow { background-color: #121824; }
+    QSplitter::handle { background-color: #1e272c; width: 2px; }
     #TitleLabel { font-size: 20px; font-weight: bold; color: #2FA572; margin-top: 8px; }
     #SubtitleLabel { font-size: 12px; color: #90a4ae; margin-bottom: 8px; }
     #SectionHeader { font-weight: bold; color: #90a4ae; margin-top: 4px; }
     QGroupBox {
-        border: 1px solid #37474f; border-radius: 6px; margin-top: 12px;
-        font-weight: bold; color: #90a4ae; background-color: #263238;
+        border: 1px solid #1e272c; border-radius: 6px; margin-top: 12px;
+        font-weight: bold; color: #90a4ae; background-color: #121824;
     }
     QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
     QLabel { background-color: transparent; }
     QPushButton {
-        background-color: #37474f; border: 1px solid #4f5b66; border-radius: 4px;
+        background-color: #1e272c; border: 1px solid #2c3b42; border-radius: 4px;
         padding: 6px 12px; font-weight: bold; color: #ffffff;
     }
-    QPushButton:hover { background-color: #455a64; border-color: #78909c; }
-    QPushButton:disabled { background-color: #263238; color: #56636a; border-color: #2c3b42; }
+    QPushButton:hover { background-color: #2c3b42; border-color: #37474f; }
+    QPushButton:disabled { background-color: #121824; color: #56636a; border-color: #1e272c; }
     #RunButton {
         background-color: #2FA572; border: 1px solid #1f7a52; color: white;
         font-size: 14px; padding: 9px; border-radius: 6px;
     }
     #RunButton:hover { background-color: #38b883; }
-    #RunButton:disabled { background-color: #37474f; color: #78909c; border-color: #37474f; }
+    #RunButton:disabled { background-color: #1e272c; color: #78909c; border-color: #1e272c; }
+    #SecondaryButton {
+        background-color: #37474f; border: 1px solid #4f5b62; color: white;
+        font-size: 13px; padding: 7px; border-radius: 5px.
+    }
+    #SecondaryButton:hover { background-color: #455a64; }
+    #SecondaryButton:disabled { background-color: #1e272c; color: #78909c; border-color: #1e272c; }
     QLineEdit {
-        background-color: #1c2529; color: #eceff1; border: 1px solid #37474f;
+        background-color: #0d141b; color: #eceff1; border: 1px solid #1e272c;
         border-radius: 4px; padding: 5px;
     }
     #FilePathEdit { color: #cfd8dc; }
     #LogConsole {
-        background-color: #10171a; border: 1px solid #263238; border-radius: 6px;
+        background-color: #0a1018; border: 1px solid #1e272c; border-radius: 6px;
         color: #81c784; font-family: Consolas, "Courier New", monospace; font-size: 12px;
     }
     QTableWidget {
-        background-color: #1c2529; color: #eceff1; gridline-color: #37474f;
+        background-color: #0d141b; color: #eceff1; gridline-color: #1e272c;
         selection-background-color: #2FA572; selection-color: #ffffff;
     }
-    QHeaderView::section { background-color: #263238; color: #90a4ae; padding: 4px; border: none; }
-    QTabWidget::pane { border: 1px solid #37474f; background-color: #1c2529; }
-    QTabBar::tab { background-color: #263238; color: #90a4ae; padding: 8px 16px; font-weight: bold; }
-    QTabBar::tab:selected { background-color: #1c2529; color: #ffffff; }
+    QHeaderView::section { background-color: #121824; color: #90a4ae; padding: 4px; border: none; }
+    QTabWidget::pane { border: 1px solid #1e272c; background-color: #0d141b; }
+    QTabBar::tab { background-color: #121824; color: #90a4ae; padding: 8px 16px; font-weight: bold; }
+    QTabBar::tab:selected { background-color: #0d141b; color: #ffffff; }
 
-    /* Dialogs / list widgets / scroll areas / combo boxes: covered by the
-       base QWidget rule above for bg+color, but pinned explicitly here too
-       since some platforms substitute a native (light) palette for these
-       otherwise. */
-    QDialog { background-color: #1e272c; color: #eceff1; }
-    QMessageBox { background-color: #1e272c; color: #eceff1; }
-    QScrollArea { background-color: #1e272c; border: none; }
-    QScrollArea > QWidget > QWidget { background-color: #1e272c; }
+    QDialog { background-color: #121824; color: #eceff1; }
+    QMessageBox { background-color: #121824; color: #eceff1; }
+    QScrollArea { background-color: #121824; border: none; }
+    QScrollArea > QWidget > QWidget { background-color: #121824; }
     QListWidget {
-        background-color: #1c2529; color: #eceff1; border: 1px solid #37474f; border-radius: 4px;
+        background-color: #0d141b; color: #eceff1; border: 1px solid #1e272c; border-radius: 4px;
     }
     QListWidget::item:selected { background-color: #2FA572; color: #ffffff; }
     QComboBox {
-        background-color: #1c2529; color: #eceff1; border: 1px solid #37474f;
+        background-color: #0d141b; color: #eceff1; border: 1px solid #1e272c;
         border-radius: 4px; padding: 4px;
     }
     QComboBox QAbstractItemView {
-        background-color: #1c2529; color: #eceff1; selection-background-color: #2FA572;
+        background-color: #0d141b; color: #eceff1; selection-background-color: #2FA572;
     }
 """
 
@@ -118,9 +119,7 @@ DARK_STYLESHEET = """
 # Origin offset for large DXF coordinates (survey / UTM)
 # ──────────────────────────────────────────────────────────────────────────
 def _compute_origin_offset(parsed: dict) -> tuple[float, float]:
-    """If the geometry centroid is far from the origin (> 100 m = 100 000 mm),
-    return an offset to translate everything near (0, 0) for numerical
-    stability in ETABS.  Otherwise return (0, 0)."""
+    """If geometry centroid is far from origin (> 100 m), return offset to translate near (0,0)."""
     coords = []
     for slab in parsed.get("slabs", []):
         coords.extend(slab.vertices)
@@ -159,7 +158,7 @@ class ParseWorker(qc.QThread):
             self.log_signal.emit("Loading DXF geometry...")
             doc, msp = load_dxf(self.dxf_path)
 
-            # Detect DXF drawing units and compute a scale factor to mm.
+            # Detect DXF drawing units and compute scale factor to mm.
             scale, scale_source = detect_dxf_scale_to_mm(doc, msp)
             self.log_signal.emit(f"DXF units: {scale_source} (scale factor: {scale}×)")
 
@@ -185,16 +184,14 @@ class ParseWorker(qc.QThread):
                 self.log_signal.emit("Connecting geometry (snapping shared nodes)...")
                 result = snap_connections(result, log=self.log_signal.emit)
 
-            # Remove duplicates (e.g. same element drawn as both LWPOLYLINE + HATCH).
             self.log_signal.emit("Checking for duplicates...")
             result = deduplicate_parsed(result, log=self.log_signal.emit)
 
-            # Compute origin offset for large DXF coordinates (survey/UTM).
             origin_offset = _compute_origin_offset(result)
             if origin_offset != (0.0, 0.0):
                 self.log_signal.emit(
                     f"Large coordinate offset detected: ({origin_offset[0]:.0f}, {origin_offset[1]:.0f})mm. "
-                    f"Geometry will be translated near the ETABS origin when drawing."
+                    f"Geometry will be translated near ETABS origin when drawing."
                 )
             result["origin_offset"] = origin_offset
             result["scale"] = scale
@@ -209,8 +206,8 @@ class ParseWorker(qc.QThread):
 # Main window
 # ──────────────────────────────────────────────────────────────────────────
 class ModelBuilderApp(qw.QMainWindow):
-    attach_finished = qc.Signal(bool, object)  # (ok, (SapModel, filename) | exception)
-    draw_finished = qc.Signal(bool, object)    # (ok, DrawResult | exception)
+    attach_finished = qc.Signal(bool, object)
+    draw_finished = qc.Signal(bool, object)
 
     def __init__(self, attach_pid: int = None):
         super().__init__()
@@ -225,7 +222,7 @@ class ModelBuilderApp(qw.QMainWindow):
         self.attach_finished.connect(self._on_attach_done)
         self.draw_finished.connect(self._on_draw_done)
 
-        self.setWindowTitle("DXF -> ETABS Model Builder")
+        self.setWindowTitle("DXF → ETABS Model Builder")
         self.resize(1400, 850)
         self._setup_ui()
         self._apply_styles()
@@ -245,11 +242,11 @@ class ModelBuilderApp(qw.QMainWindow):
         left_layout.setContentsMargins(20, 20, 20, 20)
         left_layout.setSpacing(12)
 
-        title = qw.QLabel("DXF -> ETABS Model Builder")
+        title = qw.QLabel("DXF → ETABS Model Builder")
         title.setObjectName("TitleLabel")
         left_layout.addWidget(title)
 
-        subtitle = qw.QLabel("Read, classify, preview, and draw into ETABS.")
+        subtitle = qw.QLabel("Load DXF → Classify layers → Extract → Draw into ETABS")
         subtitle.setObjectName("SubtitleLabel")
         left_layout.addWidget(subtitle)
 
@@ -257,7 +254,8 @@ class ModelBuilderApp(qw.QMainWindow):
         self.conn_status_label.setWordWrap(True)
         left_layout.addWidget(self.conn_status_label)
 
-        file_group = qw.QGroupBox("DXF File")
+        # --- DXF File ---
+        file_group = qw.QGroupBox("1. DXF File")
         file_layout = qw.QHBoxLayout(file_group)
         self.select_btn = qw.QPushButton("Browse DXF")
         self.select_btn.clicked.connect(self.select_file)
@@ -268,7 +266,8 @@ class ModelBuilderApp(qw.QMainWindow):
         file_layout.addWidget(self.file_path_edit)
         left_layout.addWidget(file_group)
 
-        self.layers_btn = qw.QPushButton("Detect / Confirm Layers")
+        # --- Layer Classification ---
+        self.layers_btn = qw.QPushButton("2. Detect / Confirm Layers")
         self.layers_btn.setEnabled(False)
         self.layers_btn.clicked.connect(self.confirm_layers)
         left_layout.addWidget(self.layers_btn)
@@ -277,18 +276,19 @@ class ModelBuilderApp(qw.QMainWindow):
         self.auto_connect_check.setChecked(True)
         self.auto_connect_check.setToolTip(
             "Snaps wall/beam corners and T-junctions together, and expands slab edges out to the "
-            "centerline of the beams/walls that bound them, so connected elements actually share a "
-            "node in ETABS. Turn off to preview the raw, unsnapped extraction instead."
+            "centerline of the beams/walls that bound them, so connected elements share a node in ETABS."
         )
         left_layout.addWidget(self.auto_connect_check)
 
-        self.parse_btn = qw.QPushButton("Parse && Preview")
+        # --- Parse & Preview ---
+        self.parse_btn = qw.QPushButton("3. Parse & Preview")
         self.parse_btn.setObjectName("RunButton")
         self.parse_btn.setEnabled(False)
         self.parse_btn.clicked.connect(self.run_parse)
         left_layout.addWidget(self.parse_btn)
 
-        draw_group = qw.QGroupBox("Generate & Draw")
+        # --- Draw into ETABS (Primary Action) ---
+        draw_group = qw.QGroupBox("4. Draw into ETABS")
         draw_layout = qw.QVBoxLayout(draw_group)
         fck_row = qw.QHBoxLayout()
         fck_row.addWidget(qw.QLabel("Concrete grade fck (N/mm²):"))
@@ -298,35 +298,50 @@ class ModelBuilderApp(qw.QMainWindow):
         fck_row.addStretch()
         draw_layout.addLayout(fck_row)
 
-        btn_row = qw.QHBoxLayout()
-        self.export_btn = qw.QPushButton("Export Centerline DXF...")
-        self.export_btn.setEnabled(False)
-        self.export_btn.clicked.connect(self.export_dxf)
-        btn_row.addWidget(self.export_btn)
-        
-        self.import_draw_btn = qw.QPushButton("Import Clean DXF && Draw...")
-        self.import_draw_btn.setObjectName("RunButton")
-        self.import_draw_btn.clicked.connect(self.import_and_draw)
-        btn_row.addWidget(self.import_draw_btn)
-        draw_layout.addLayout(btn_row)
-
-        self.draw_btn = qw.QPushButton("Draw Extracted Directly Into ETABS")
+        self.draw_btn = qw.QPushButton("Draw Extracted Geometry Into ETABS")
+        self.draw_btn.setObjectName("RunButton")
         self.draw_btn.setEnabled(False)
         self.draw_btn.clicked.connect(self.run_draw)
         draw_layout.addWidget(self.draw_btn)
         left_layout.addWidget(draw_group)
 
+        # --- Advanced: Clean DXF Export/Import (Optional) ---
+        adv_group = qw.QGroupBox("Advanced: Clean Centerline DXF (Optional)")
+        adv_layout = qw.QVBoxLayout(adv_group)
+        adv_layout.setSpacing(8)
+
+        exp_row = qw.QHBoxLayout()
+        self.export_btn = qw.QPushButton("Export Clean Centerline DXF…")
+        self.export_btn.setObjectName("SecondaryButton")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self.export_dxf)
+        exp_row.addWidget(self.export_btn)
+        exp_row.addStretch()
+        adv_layout.addLayout(exp_row)
+
+        imp_row = qw.QHBoxLayout()
+        self.import_draw_btn = qw.QPushButton("Import Clean DXF & Draw…")
+        self.import_draw_btn.setObjectName("SecondaryButton")
+        self.import_draw_btn.clicked.connect(self.import_and_draw)
+        imp_row.addWidget(self.import_draw_btn)
+        imp_row.addStretch()
+        adv_layout.addLayout(imp_row)
+
+        left_layout.addWidget(adv_group)
+
+        # --- Log ---
         log_label = qw.QLabel("Process Log:")
         log_label.setObjectName("SectionHeader")
         left_layout.addWidget(log_label)
         self.log_box = qw.QTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setObjectName("LogConsole")
-        self.log_box.append("Browse a DXF file to begin.")
+        self.log_box.append("Ready. Browse a DXF file to begin.")
         left_layout.addWidget(self.log_box)
 
         splitter.addWidget(left)
 
+        # --- Right side: Viewer + Tables ---
         right_tabs = qw.QTabWidget()
         config = Configuration(lineweight_scaling=0)
         self.viewer = CADViewer.from_config(config)
@@ -346,13 +361,13 @@ class ModelBuilderApp(qw.QMainWindow):
         right_tabs.addTab(self.results_table, "ETABS Draw Results")
 
         splitter.addWidget(right_tabs)
-        splitter.setSizes([380, 1020])
+        splitter.setSizes([400, 1000])
         self.right_tabs = right_tabs
 
     def _apply_styles(self):
         self.setStyleSheet(DARK_STYLESHEET)
 
-    # ---- logic --------------------------------------------------------
+    # ---- Logging & status -------------------------------------------------
     def log(self, message: str):
         self.log_box.append(message)
         self.log_box.ensureCursorVisible()
@@ -361,7 +376,7 @@ class ModelBuilderApp(qw.QMainWindow):
         self.conn_status_label.setText(text)
         self.conn_status_label.setStyleSheet(f"color: {color};")
 
-    # ---- ETABS connection -----------------------------------------------
+    # ---- ETABS connection -------------------------------------------------
     def _start_attach(self, pid: int):
         self._set_conn_status(f"Attaching to ETABS (PID {pid})...", "#ffb74d")
         self.log(f"\nAttaching to ETABS PID {pid}...")
@@ -389,10 +404,9 @@ class ModelBuilderApp(qw.QMainWindow):
     def _update_draw_button_state(self):
         can_draw = self.sap_model is not None and self.last_parse_result is not None
         self.draw_btn.setEnabled(can_draw)
-        if hasattr(self, 'export_btn'):
-            self.export_btn.setEnabled(self.last_parse_result is not None)
+        self.export_btn.setEnabled(self.last_parse_result is not None)
 
-    # ---- Draw into ETABS --------------------------------------------------
+    # ---- Draw into ETABS (Primary) ----------------------------------------
     def run_draw(self):
         if self.sap_model is None or self.last_parse_result is None:
             return
@@ -407,7 +421,7 @@ class ModelBuilderApp(qw.QMainWindow):
         self.draw_btn.setEnabled(False)
         self.parse_btn.setEnabled(False)
         self.log("\n" + "=" * 50)
-        self.log(f"Drawing into ETABS (fck={fck:g} N/mm2)...")
+        self.log(f"Drawing into ETABS (fck={fck:g} N/mm²)...")
 
         parsed = self.last_parse_result
         sap_model = self.sap_model
@@ -433,13 +447,13 @@ class ModelBuilderApp(qw.QMainWindow):
         result = payload
         drawn_total = sum(result.drawn.values())
         skipped_total = sum(len(v) for v in result.skipped.values())
-        self.log(f"Drawn: {result.drawn}. Skipped: { {k: len(v) for k, v in result.skipped.items()} }.")
+        self.log(f"Drawn: {result.drawn}. Skipped: {{k: len(v) for k, v in result.skipped.items()}}.")
         self._populate_draw_results(result)
         self.right_tabs.setCurrentIndex(2)
         qw.QMessageBox.information(
             self, "Draw Complete",
             f"Drew {drawn_total} object(s) into ETABS.\n"
-            f"Skipped {skipped_total} (see the ETABS Draw Results tab for reasons).")
+            f"Skipped {skipped_total} (see ETABS Draw Results tab for reasons).")
 
     def _populate_draw_results(self, result):
         rows = []
@@ -460,6 +474,7 @@ class ModelBuilderApp(qw.QMainWindow):
                 self.results_table.setItem(r, c, item)
         self.results_table.resizeColumnsToContents()
 
+    # ---- File selection & layer classification ----------------------------
     def select_file(self):
         filename, _ = qw.QFileDialog.getOpenFileName(self, "Select DXF Drawing", "", "DXF Files (*.dxf);;All Files (*)")
         if not filename:
@@ -498,6 +513,7 @@ class ModelBuilderApp(qw.QMainWindow):
         else:
             self.log("Layer confirmation cancelled.")
 
+    # ---- Parse & Preview --------------------------------------------------
     def run_parse(self):
         if not self.dxf_path:
             return
@@ -525,6 +541,7 @@ class ModelBuilderApp(qw.QMainWindow):
         self._populate_summary(result)
         self.right_tabs.setCurrentIndex(1)
 
+    # ---- Clean DXF Export (Optional) --------------------------------------
     def export_dxf(self):
         if not self.last_parse_result:
             return
@@ -533,9 +550,12 @@ class ModelBuilderApp(qw.QMainWindow):
             return
         try:
             export_clean_dxf(self.last_parse_result, path, log=self.log)
+            self.log(f"Clean DXF exported to: {path}")
         except Exception as e:
             self.log(f"Export failed: {e}")
+            qw.QMessageBox.critical(self, "Export Error", str(e))
 
+    # ---- Clean DXF Import & Draw (Optional) -------------------------------
     def import_and_draw(self):
         if not self.sap_model:
             qw.QMessageBox.warning(self, "Not Connected", "Please connect to ETABS first (e.g. by launching via the main tool).")
@@ -555,7 +575,9 @@ class ModelBuilderApp(qw.QMainWindow):
             self.run_draw()
         except Exception as e:
             self.log(f"Import failed: {e}")
+            qw.QMessageBox.critical(self, "Import Error", str(e))
 
+    # ---- Summary Table ----------------------------------------------------
     def _populate_summary(self, result: dict):
         rows = []
         for slab in result["slabs"]:
@@ -563,15 +585,15 @@ class ModelBuilderApp(qw.QMainWindow):
                          slab.thickness_source, "; ".join(slab.warnings)))
         for wall in result["walls"]:
             kind = "Wall (Str)" if wall.is_structural else "Wall (NS)"
-            rows.append((kind, wall.name, wall.layer, f"{wall.thickness_mm} mm thk, {wall.length_m} m long",
+            rows.append((kind, wall.name, wall.layer, f"{wall.thickness_mm} mm thk, {wall.length_m:.2f} m long",
                          wall.thickness_source, "; ".join(wall.warnings)))
         for beam in result["beams"]:
-            rows.append(("Beam", beam.name, beam.layer, f"{beam.width_mm:.0f} x {beam.depth_mm:.0f} mm",
+            rows.append(("Beam", beam.name, beam.layer, f"{beam.width_mm:.0f} × {beam.depth_mm:.0f} mm",
                          beam.dimension_source, "; ".join(beam.warnings)))
         for col in result["columns"]:
-            angle_info = f" @ {col.angle_deg:.0f}\u00b0" if col.angle_deg != 0 else ""
+            angle_info = f" @ {col.angle_deg:.0f}°" if col.angle_deg != 0 else ""
             rows.append(("Column", col.name, col.layer,
-                         f"{col.width_mm:.0f} x {col.depth_mm:.0f} mm{angle_info}",
+                         f"{col.width_mm:.0f} × {col.depth_mm:.0f} mm{angle_info}",
                          col.dimension_source, "; ".join(col.warnings)))
 
         self.summary_table.setRowCount(len(rows))
@@ -585,10 +607,6 @@ class ModelBuilderApp(qw.QMainWindow):
 
 
 def main():
-    # --pid <N> lets a launcher (the "DXF Model Builder" card in
-    # etabs_gui.pyw) attach this window to the same ETABS instance it's
-    # already connected to, instead of connecting separately. Mirrors
-    # etabs_gui.pyw's own --pid convention exactly.
     attach_pid = None
     if "--pid" in sys.argv:
         try:
@@ -597,9 +615,6 @@ def main():
             pass
 
     app = qw.QApplication(sys.argv)
-    # Applied at the QApplication level (not just the main window) so it
-    # reaches every top-level widget -- QMessageBox, QInputDialog, the
-    # LayerConfirmDialog -- regardless of Windows' own light/dark setting.
     app.setStyleSheet(DARK_STYLESHEET)
     window = ModelBuilderApp(attach_pid=attach_pid)
     window.show()
