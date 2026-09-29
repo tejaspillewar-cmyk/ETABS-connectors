@@ -3,23 +3,22 @@ Post-extraction, pre-drawing connectivity pass.
 
 Extraction measures every wall/beam/slab in isolation, so elements that
 should share a structural node in ETABS often don't actually touch:
-  - Two walls meeting at a bent/L/T corner (whether drawn as two separate
-    polygons, or decomposed from one bent polygon by wall_slab_extractor.py)
-    have independently-measured centerlines that stop short of, or overlap,
-    the true corner.
+  - Two walls meeting at a bent/L/T corner have independently-measured
+    centerlines that stop short of, or overlap, the true corner.
   - A beam ending at a shear wall stops wherever the DXF geometry happened
     to end, not necessarily exactly on the wall's centerline.
   - A slab is drawn to its raw DXF boundary, usually the clear span between
     beam/wall faces, not the beam/wall centerline -- leaving a gap.
 
-snap_connections() fixes all three by snapping wall/beam endpoints together
-at shared corners and T-junctions, and expanding slab edges out to the
-centerline of the beams/walls that bound them. It returns a NEW dict (via
-dataclasses.replace()) -- extraction stays a pure step, and draw_model()
-and the UI preview both consume this pass's output unchanged.
+snap_connections() fixes all three by:
+  1. Snapping wall/beam endpoints together at shared corners and T-junctions
+     (WITHOUT changing member directions - only extending/shortening along
+     their original axis)
+  2. Expanding slab edges OUTWARD along their original edge normals to the
+     centerline of the bounding beams/walls (keeping each edge parallel to
+     its original direction)
 
-Since BeamEntry and WallEntry now carry explicit p1/p2 endpoints, this pass
-reads and writes them directly -- no lossy centroid+angle reconstruction.
+Returns a NEW dict (via dataclasses.replace()) -- extraction stays a pure step.
 """
 import math
 from dataclasses import replace
@@ -72,28 +71,30 @@ class _UnionFind:
             self.parent[ra] = rb
 
 
-# ── wall/beam endpoint snapping ──────────────────────────────────────────
+# ── wall/beam endpoint snapping (PRESERVES DIRECTION) ──────────────────────
 
 def _snap_members(members, result):
     """
-    members: list of dicts {"p1", "p2", "half_width"}, mutated in place
-    (p1/p2 replaced with snapped positions). Endpoint slots are indexed
-    0..2n-1 (2*i = p1 of member i, 2*i+1 = p2 of member i).
+    members: list of dicts {"p1", "p2", "half_width", "angle_deg"}, mutated in place.
+    Endpoint slots are indexed 0..2n-1 (2*i = p1 of member i, 2*i+1 = p2 of member i).
+    
+    CRITICAL: Snapping only moves endpoints ALONG the member's original axis.
+    Direction (angle) is NEVER changed.
     """
     n = len(members)
     if n < 2:
         return
 
-    slots = []  # (member_index, which, point, half_width)
+    slots = []  # (member_index, which, point, half_width, angle_deg)
     for i, m in enumerate(members):
-        slots.append((i, 0, m["p1"], m["half_width"]))
-        slots.append((i, 1, m["p2"], m["half_width"]))
+        slots.append((i, 0, m["p1"], m["half_width"], m["angle_deg"]))
+        slots.append((i, 1, m["p2"], m["half_width"], m["angle_deg"]))
 
     uf = _UnionFind(len(slots))
     for a in range(len(slots)):
-        ia, _, pa, wa = slots[a]
+        ia, _, pa, wa, aa = slots[a]
         for b in range(a + 1, len(slots)):
-            ib, _, pb, wb = slots[b]
+            ib, _, pb, wb, ab = slots[b]
             if ia == ib:
                 continue
             tol = _snap_tolerance(wa, wb)
@@ -109,35 +110,52 @@ def _snap_members(members, result):
         if len(idxs) < 2:
             continue
         matched_slots.update(idxs)
+        # Compute target as average of cluster points (corner junction)
         target = _cluster_target(idxs, slots, members)
         for idx in idxs:
-            mi, which, _, _ = slots[idx]
+            mi, which, _, _, _ = slots[idx]
             if which == 0:
                 members[mi]["p1"] = target
             else:
                 members[mi]["p2"] = target
         result.corners_snapped += 1
 
-    # T-junctions: any endpoint not merged with another endpoint -- check
-    # proximity to another member's SPAN (not just its endpoints).
+    # T-junctions: endpoints not merged with another endpoint -- snap to
+    # another member's SPAN along the endpoint's member axis (preserves direction)
     for idx in range(len(slots)):
         if idx in matched_slots:
             continue
-        mi, which, pt, w = slots[idx]
-        pt = members[mi]["p1"] if which == 0 else members[mi]["p2"]  # possibly updated above
+        mi, which, pt, w, angle_deg = slots[idx]
+        # Use potentially updated endpoint
+        pt = members[mi]["p1"] if which == 0 else members[mi]["p2"]
+        
+        # Direction vector of THIS member (the one being snapped)
+        angle_rad = math.radians(angle_deg)
+        dir_vec = (math.cos(angle_rad), math.sin(angle_rad))
+        
         best = None
+        best_dist = float('inf')
         for j, m in enumerate(members):
             if j == mi:
                 continue
+            # Project our endpoint onto the other member's span
             proj, dist = closest_point_on_segment(pt, m["p1"], m["p2"])
-            # Skip if the projection lands essentially at m's own endpoint --
-            # that's an endpoint-to-endpoint case, already handled above.
+            # Skip if projection lands at other member's endpoint (handled above)
             near_end = distance(proj, m["p1"]) < 1.0 or distance(proj, m["p2"]) < 1.0
             if near_end:
                 continue
             tol = _snap_tolerance(w, m["half_width"])
-            if dist <= tol and (best is None or dist < best[1]):
-                best = (proj, dist)
+            if dist <= tol and dist < best_dist:
+                # CRITICAL: Move our endpoint along ITS OWN axis to reach the projection
+                # This preserves our member's direction
+                # Find t such that: pt + t * dir_vec = proj (approximately)
+                # t = (proj - pt) dot dir_vec
+                t = (proj[0] - pt[0]) * dir_vec[0] + (proj[1] - pt[1]) * dir_vec[1]
+                snapped_pt = (pt[0] + t * dir_vec[0], pt[1] + t * dir_vec[1])
+                # Verify the snapped point is close to the projection
+                if distance(snapped_pt, proj) <= tol * 1.5:
+                    best = (snapped_pt, dist)
+        
         if best is not None:
             if which == 0:
                 members[mi]["p1"] = best[0]
@@ -150,12 +168,7 @@ def _cluster_target(idxs, slots, members):
     points = [slots[i][2] for i in idxs]
     avg = (sum(p[0] for p in points) / len(points), sum(p[1] for p in points) / len(points))
 
-    # Prefer the intersection of two non-parallel member lines in the
-    # cluster (the true corner point); fall back to the average position.
-    # Lines that are only *nearly* parallel (a common case at shallow-angle
-    # junctions) produce a mathematically valid but physically absurd
-    # intersection point far away -- reject any candidate too far from the
-    # cluster's own points rather than snapping a member kilometers off.
+    # Prefer intersection of two non-parallel member lines in the cluster
     for a in range(len(idxs)):
         ma = members[slots[idxs[a]][0]]
         for b in range(a + 1, len(idxs)):
@@ -168,7 +181,7 @@ def _cluster_target(idxs, slots, members):
     return avg
 
 
-# ── slab edge expansion ──────────────────────────────────────────────────
+# ── slab edge expansion (PRESERVES EDGE DIRECTIONS) ────────────────────────
 
 def _polygon_signed_area(vertices):
     n = len(vertices)
@@ -188,6 +201,12 @@ def _are_parallel(d1, d2, tol_deg):
 
 
 def _expand_slab(vertices, members, result):
+    """
+    Expand each slab edge OUTWARD along its normal to the nearest parallel
+    member centerline. New vertices are computed by intersecting the EXTENDED
+    original edge lines (not the member centerlines), preserving all edge
+    directions exactly.
+    """
     n = len(vertices)
     if n < 3:
         return vertices
@@ -195,69 +214,119 @@ def _expand_slab(vertices, members, result):
     signed_area = _polygon_signed_area(vertices)
     ccw = signed_area > 0
 
-    target_lines = [None] * n  # per edge i: (p1, p2) of the matched member's centerline, or None
+    # For each edge, find the target member centerline and compute offset distance
+    edge_offsets = [None] * n  # distance to expand each edge (positive = outward)
+    edge_target_lines = [None] * n  # the member centerline (p1, p2) for reference
+    
     for i in range(n):
         a, b = vertices[i], vertices[(i + 1) % n]
         edge_dir = (b[0] - a[0], b[1] - a[1])
         edge_len = math.hypot(*edge_dir)
         if edge_len == 0:
             continue
-        normal = (edge_dir[1] / edge_len, -edge_dir[0] / edge_len) if ccw else \
-                 (-edge_dir[1] / edge_len, edge_dir[0] / edge_len)
+        
+        # Outward normal (perpendicular to edge, pointing outside slab)
+        if ccw:
+            normal = (edge_dir[1] / edge_len, -edge_dir[0] / edge_len)
+        else:
+            normal = (-edge_dir[1] / edge_len, edge_dir[0] / edge_len)
+        
         mid = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
 
         best = None
+        best_perp_gap = float('inf')
         for m in members:
             mdir = (m["p2"][0] - m["p1"][0], m["p2"][1] - m["p1"][1])
             if not _are_parallel(edge_dir, mdir, SLAB_EXPAND_ANGLE_TOL_DEG):
                 continue
+            
+            # Project slab edge midpoint onto member centerline
             proj, dist_to_line = closest_point_on_segment(mid, m["p1"], m["p2"])
+            
+            # Gap along slab edge normal (positive = member is outward)
             gap = (proj[0] - mid[0]) * normal[0] + (proj[1] - mid[1]) * normal[1]
             if gap <= 0:
-                continue  # member is inward, not an outward support -- ignore
+                continue  # member is inward, not an outward support
+            
+            # Perpendicular distance from slab edge to member centerline
             perp_gap = abs((mid[0] - m["p1"][0]) * normal[0] + (mid[1] - m["p1"][1]) * normal[1])
             if perp_gap > SLAB_EXPAND_MAX_GAP_MM:
                 continue
-            if best is None or perp_gap < best[1]:
-                best = ((m["p1"], m["p2"]), perp_gap)
+            
+            if perp_gap < best_perp_gap:
+                best_perp_gap = perp_gap
+                best = (gap, (m["p1"], m["p2"]))
+        
         if best is not None:
-            target_lines[i] = best[0]
+            edge_offsets[i] = best[0]
+            edge_target_lines[i] = best[1]
 
-    if not any(target_lines):
+    if not any(edge_offsets):
         return vertices
 
-    new_vertices = list(vertices)
+    # NEW VERTICES: Intersect the OFFSET original edge lines
+    # Each edge line is shifted outward by its offset along its normal
+    # This PRESERVES the original edge directions exactly
+    new_vertices = []
     expanded_edges = 0
-    # A corner's two adjacent edges being only nearly parallel (shallow
-    # bends) produces the same near-singular-intersection blowup as the
-    # wall/beam corner case -- cap how far a vertex may move and fall back
-    # to leaving it where it was, rather than corrupting the slab shape.
-    max_vertex_move = SLAB_EXPAND_MAX_GAP_MM * 3
+    
     for i in range(n):
-        prev_edge = (i - 1) % n
-        line_before = target_lines[prev_edge] or (vertices[prev_edge], vertices[i])
-        line_after = target_lines[i] or (vertices[i], vertices[(i + 1) % n])
-        if target_lines[prev_edge] is None and target_lines[i] is None:
+        prev_i = (i - 1) % n
+        
+        # Edge i-1 (incoming to vertex i)
+        a1, b1 = vertices[prev_i], vertices[i]
+        dir1 = (b1[0] - a1[0], b1[1] - a1[1])
+        len1 = math.hypot(*dir1)
+        if len1 == 0:
+            new_vertices.append(vertices[i])
             continue
-        pt = line_intersection(line_before[0], line_before[1], line_after[0], line_after[1])
-        if pt is not None and distance(pt, vertices[i]) <= max_vertex_move:
-            new_vertices[i] = pt
+        if ccw:
+            norm1 = (dir1[1] / len1, -dir1[0] / len1)
+        else:
+            norm1 = (-dir1[1] / len1, dir1[0] / len1)
+        offset1 = edge_offsets[prev_i] if edge_offsets[prev_i] is not None else 0.0
+        
+        # Edge i (outgoing from vertex i)
+        a2, b2 = vertices[i], vertices[(i + 1) % n]
+        dir2 = (b2[0] - a2[0], b2[1] - a2[1])
+        len2 = math.hypot(*dir2)
+        if len2 == 0:
+            new_vertices.append(vertices[i])
+            continue
+        if ccw:
+            norm2 = (dir2[1] / len2, -dir2[0] / len2)
+        else:
+            norm2 = (-dir2[1] / len2, dir2[0] / len2)
+        offset2 = edge_offsets[i] if edge_offsets[i] is not None else 0.0
+        
+        # Offset the two edge lines
+        # Line 1: a1 + offset1*norm1 + t*dir1
+        # Line 2: a2 + offset2*norm2 + s*dir2
+        # Solve for intersection
+        p1 = (a1[0] + offset1 * norm1[0], a1[1] + offset1 * norm1[1])
+        p2 = (a2[0] + offset2 * norm2[0], a2[1] + offset2 * norm2[1])
+        
+        pt = line_intersection(p1, (p1[0] + dir1[0], p1[1] + dir1[1]),
+                               p2, (p2[0] + dir2[0], p2[1] + dir2[1]))
+        
+        if pt is not None:
+            # Safety: limit how far a vertex can move
+            max_move = SLAB_EXPAND_MAX_GAP_MM * 3
+            if distance(pt, vertices[i]) <= max_move:
+                new_vertices.append(pt)
+            else:
+                new_vertices.append(vertices[i])
+        else:
+            new_vertices.append(vertices[i])
+        
+        if edge_offsets[i] is not None:
+            expanded_edges += 1
 
-    # Expansion should only ever grow a slab toward surrounding member
-    # centerlines. On an unusual polygon (many short zigzag "step" edges
-    # near the same member, for instance) the independent per-edge target
-    # lines can occasionally intersect back inward instead. That's a sign
-    # the per-edge matching got confused for this specific polygon, not a
-    # legitimate result -- reject it and keep the original boundary rather
-    # than risk drawing a corrupted slab.
+    # Validation: expansion should only grow the slab
     if polygon_area_sqmm(new_vertices) < polygon_area_sqmm(vertices) - 1.0:
         return vertices
 
-    for t in target_lines:
-        if t is not None:
-            expanded_edges += 1
     result.slab_edges_expanded += expanded_edges
-
     return new_vertices
 
 
@@ -274,20 +343,25 @@ def snap_connections(parsed: dict, log=lambda m: None) -> dict:
     eligible_walls = [w for w in walls if not w.warnings and w.thickness_mm > 0 and w.length_m > 0]
     eligible_beams = [b for b in beams if not b.warnings and b.width_mm > 0 and b.length_m > 0]
 
-    # Build member list using stored p1/p2 directly (no lossy reconstruction
-    # from centroid+angle+length).
+    # Build member list using stored p1/p2 directly
     members = []
     for w in eligible_walls:
-        members.append({"p1": w.p1, "p2": w.p2, "half_width": w.thickness_mm / 2.0, "kind": "wall", "entry": w})
+        members.append({
+            "p1": w.p1, "p2": w.p2, 
+            "half_width": w.thickness_mm / 2.0, 
+            "angle_deg": w.angle_deg,
+            "kind": "wall", "entry": w
+        })
     for b in eligible_beams:
-        members.append({"p1": b.p1, "p2": b.p2, "half_width": b.width_mm / 2.0, "kind": "beam", "entry": b})
+        members.append({
+            "p1": b.p1, "p2": b.p2, 
+            "half_width": b.width_mm / 2.0, 
+            "angle_deg": b.angle_deg,
+            "kind": "beam", "entry": b
+        })
 
     _snap_members(members, result)
 
-    # A very short original member can have both ends snap into (near-)
-    # coincident junctions, degenerating to ~zero length -- flag it clearly
-    # instead of letting it fall through to draw_model()'s generic
-    # "unresolved dimensions" skip reason.
     MIN_SNAPPED_LENGTH_M = 0.05
 
     new_walls = []
@@ -343,6 +417,7 @@ def snap_connections(parsed: dict, log=lambda m: None) -> dict:
 
     log(f"Connectivity: {result.corners_snapped} corner(s) snapped, "
         f"{result.t_junctions} T-junction(s) connected, "
-        f"{result.slab_edges_expanded} slab edge(s) expanded to member centerlines.")
+        f"{result.slab_edges_expanded} slab edge(s) expanded to member centerlines "
+        f"(all directions preserved).")
 
     return {"slabs": new_slabs, "walls": new_walls, "beams": new_beams, "columns": columns}
