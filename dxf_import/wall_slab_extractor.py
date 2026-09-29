@@ -33,8 +33,8 @@ import re
 from dataclasses import dataclass, field
 
 from .geometry import (
-    polygon_area_sqmm, sqmm_to_sqm, polygon_centroid, point_in_polygon, min_bounding_rectangle,
-    distance, line_angle, pair_parallel_segments,
+    polygon_area_sqmm, sqmm_to_sqm, polygon_area_centroid, point_in_polygon, min_bounding_rectangle,
+    distance, line_angle, pair_parallel_segments, extract_centerline_from_polygon,
 )
 from .dxf_helpers import extract_closed_polygons, extract_text_entities, scale_polygon_dicts, scale_text_dicts
 
@@ -151,7 +151,7 @@ def extract_slabs(msp, slab_layers: list[str], scale: float = 1.0) -> list[SlabE
 
         area_sqm = sqmm_to_sqm(polygon_area_sqmm(vertices))
         volume_cum = area_sqm * (thickness_mm / 1000.0)
-        cx, cy = polygon_centroid(vertices)
+        cx, cy = polygon_area_centroid(vertices)
 
         counters[thickness_mm] = counters.get(thickness_mm, 0) + 1
         name = f"S{counters[thickness_mm]}-{thickness_mm}"
@@ -216,24 +216,24 @@ def _resolve_thickness_and_warnings(geom_thickness, layer, text_match_vertices, 
 
 def _decompose_bent_wall(vertices, layer, thk_labels, used_labels):
     """
-    Pairs up a bent/L/T wall polygon's own boundary edges into straight
-    centerline legs (same technique as beam_extractor's parallel-line
-    pairing, applied to the polygon's edges instead of independent LINEs).
+    Uses medial axis to get true centerline legs for bent/L/T walls.
     Returns a list of leg dicts, or [] if no legs could be found.
     """
-    n = len(vertices)
-    edges = [(vertices[i], vertices[(i + 1) % n]) for i in range(n)]
-    lo, hi = WALL_THICKNESS_PLAUSIBLE_MM
-    pairs = pair_parallel_segments(edges, lo, hi)
+    centerlines = extract_centerline_from_polygon(vertices)
+    if not centerlines:
+        return []
 
     legs = []
-    for pair in pairs:
-        p1, p2 = pair["p1"], pair["p2"]
+    for (p1, p2), width in centerlines:
+        length_m = distance(p1, p2) / 1000.0
+        if length_m < 0.1:  # skip tiny spurs
+            continue
         centroid = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
         angle_deg = line_angle(p1, p2)
-        length_m = distance(p1, p2) / 1000.0
+        
+        # Resolve thickness (same logic as straight walls)
         thickness_mm, thickness_raw_mm, source, label_text, warnings = _resolve_thickness_and_warnings(
-            pair["width"], layer, vertices, thk_labels, used_labels
+            width, layer, vertices, thk_labels, used_labels
         )
         legs.append({
             "p1": p1, "p2": p2,

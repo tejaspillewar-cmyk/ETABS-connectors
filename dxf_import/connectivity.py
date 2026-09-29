@@ -27,7 +27,7 @@ import math
 from dataclasses import replace
 
 from .geometry import (
-    distance, line_angle, line_intersection, closest_point_on_segment,
+    distance, line_angle, line_intersection, closest_point_on_segment, project_point_on_line,
     polygon_area_sqmm, sqmm_to_sqm, polygon_centroid,
 )
 
@@ -328,6 +328,9 @@ def _expand_slab(vertices, members, result):
     member centerline. New vertices are computed by intersecting the EXTENDED
     original edge lines (not the member centerlines), preserving all edge
     directions exactly.
+    
+    Only expands to members that SPAN the full slab edge (projection of edge
+    endpoints onto member covers [0,1] with tolerance).
     """
     n = len(vertices)
     if n < 3:
@@ -355,14 +358,21 @@ def _expand_slab(vertices, members, result):
         mid = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
 
         best = None
-        best_perp_gap = float('inf')
+        best_score = float('inf')
         for m in members:
             mdir = (m["p2"][0] - m["p1"][0], m["p2"][1] - m["p1"][1])
             if not _are_parallel(edge_dir, mdir, SLAB_EXPAND_ANGLE_TOL_DEG):
                 continue
             
-            # Project slab edge midpoint onto member centerline
+            # Project slab edge MIDPOINT onto member centerline
             proj, dist_to_line = closest_point_on_segment(mid, m["p1"], m["p2"])
+            
+            # NEW: Check if member spans the slab edge (projection of edge endpoints onto member)
+            t_a = project_point_on_line(a, m["p1"], m["p2"])
+            t_b = project_point_on_line(b, m["p1"], m["p2"])
+            t_min, t_max = min(t_a, t_b), max(t_a, t_b)
+            # Member covers slab edge if [t_min, t_max] covers [0, 1] with some tolerance
+            covers = (t_min <= 0.1 and t_max >= 0.9)
             
             # Gap along slab edge normal (positive = member is outward)
             gap = (proj[0] - mid[0]) * normal[0] + (proj[1] - mid[1]) * normal[1]
@@ -374,8 +384,10 @@ def _expand_slab(vertices, members, result):
             if perp_gap > SLAB_EXPAND_MAX_GAP_MM:
                 continue
             
-            if perp_gap < best_perp_gap:
-                best_perp_gap = perp_gap
+            # Prefer members that fully span the edge
+            score = perp_gap + (0.0 if covers else 1000.0)
+            if score < best_score:
+                best_score = score
                 best = gap
         
         if best is not None:

@@ -16,7 +16,7 @@ Convention (as described by the user):
 import re
 from dataclasses import dataclass, field
 
-from .geometry import distance, polygon_centroid, polygon_area_sqmm, sqmm_to_sqm, min_bounding_rectangle
+from .geometry import distance, polygon_area_centroid, polygon_area_sqmm, sqmm_to_sqm, min_bounding_rectangle, extract_centerline_from_polygon, line_angle
 from .dxf_helpers import extract_all_polygons, extract_text_entities, scale_polygon_dicts, scale_text_dicts
 
 COL_DIM_PATTERN = re.compile(r"(\d+)\s*[xX\*]\s*(\d+)")
@@ -70,20 +70,28 @@ def extract_columns(msp, column_layers: list[str], scale: float = 1.0) -> list[C
     entries = []
     counter = 0
     for fp in footprints:
-        cx, cy = polygon_centroid(fp["vertices"])
+        # USE AREA CENTROID (not vertex average)
+        cx, cy = polygon_area_centroid(fp["vertices"])
         area_sqm = sqmm_to_sqm(polygon_area_sqmm(fp["vertices"]))
 
-        # Always extract rotation from the drawn geometry.
-        rect = min_bounding_rectangle(fp["vertices"])
-        angle_deg = rect["angle_deg"]
-
-        best_idx, best_dist = -1, float("inf")
-        for idx, txt in enumerate(label_texts):
-            if idx in used_labels:
-                continue
-            d = distance((cx, cy), txt["position"])
-            if d < best_dist:
-                best_dist, best_idx = d, idx
+        # TRY MEDIAL AXIS for true centerline + orientation
+        centerlines = extract_centerline_from_polygon(fp["vertices"])
+        
+        if centerlines:
+            # For columns, medial axis gives center point(s). Use longest segment's angle.
+            longest = max(centerlines, key=lambda cl: distance(cl[0][0], cl[0][1]))
+            (cl_p1, cl_p2), _ = longest
+            angle_deg = line_angle(cl_p1, cl_p2)
+            # Width/depth from MBR (more stable for section dims)
+            rect = min_bounding_rectangle(fp["vertices"])
+            geom_width = round(rect["width"] / 5.0) * 5
+            geom_depth = round(rect["length"] / 5.0) * 5
+        else:
+            # Fallback to MBR
+            rect = min_bounding_rectangle(fp["vertices"])
+            angle_deg = rect["angle_deg"]
+            geom_width = round(rect["width"] / 5.0) * 5
+            geom_depth = round(rect["length"] / 5.0) * 5
 
         counter += 1
         if best_idx != -1 and best_dist <= MAX_LABEL_DISTANCE_MM:
@@ -99,8 +107,6 @@ def extract_columns(msp, column_layers: list[str], scale: float = 1.0) -> list[C
         else:
             # Geometry fallback: measure dimensions from the drawn polygon
             # instead of reporting 0×0 and skipping the column entirely.
-            geom_width = round(rect["width"] / 5.0) * 5   # nearest 5mm
-            geom_depth = round(rect["length"] / 5.0) * 5  # nearest 5mm
             if geom_width > 0 and geom_depth > 0:
                 entries.append(ColumnEntry(
                     name=f"COL-{counter}", layer=fp["layer"],

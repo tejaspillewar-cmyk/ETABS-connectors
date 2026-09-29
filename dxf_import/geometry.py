@@ -23,13 +23,33 @@ def sqmm_to_sqm(area_sqmm: float) -> float:
     return area_sqmm / 1_000_000.0
 
 
-def polygon_centroid(vertices: list[tuple[float, float]]) -> tuple[float, float]:
+def polygon_area_centroid(vertices: list[tuple[float, float]]) -> tuple[float, float]:
+    """True area-weighted centroid (center of mass) of a polygon."""
     n = len(vertices)
-    if n == 0:
+    if n < 3:
         return (0.0, 0.0)
-    cx = sum(v[0] for v in vertices) / n
-    cy = sum(v[1] for v in vertices) / n
+    area = 0.0
+    cx = 0.0
+    cy = 0.0
+    for i in range(n):
+        x1, y1 = vertices[i]
+        x2, y2 = vertices[(i + 1) % n]
+        cross = x1 * y2 - x2 * y1
+        area += cross
+        cx += (x1 + x2) * cross
+        cy += (y1 + y2) * cross
+    area *= 0.5
+    if abs(area) < 1e-9:
+        # Degenerate: fall back to vertex average
+        return (sum(v[0] for v in vertices) / n, sum(v[1] for v in vertices) / n)
+    cx /= (6.0 * area)
+    cy /= (6.0 * area)
     return (cx, cy)
+
+
+# Backward compatibility alias
+def polygon_centroid(vertices: list[tuple[float, float]]) -> tuple[float, float]:
+    return polygon_area_centroid(vertices)
 
 
 def point_in_polygon(px: float, py: float, polygon: list[tuple[float, float]]) -> bool:
@@ -520,12 +540,12 @@ def pair_parallel_segments(
 
     Returns a list of {"p1", "p2", "width", "overlap_length", "source_indices"}
     dicts. p1/p2 are the paired segments' true midline -- endpoint
-    correspondence is resolved by whichever pairing (same-order vs crossed)
-    puts endpoints closer together, so a segment stored in the opposite
-    direction to its partner still produces a straight (not twisted)
-    centerline. source_indices are the two indices into the input `segments`
-    list that were paired, so callers can look up their own per-segment
-    metadata (e.g. layer name).
+    correspondence is resolved by projecting seg2 endpoints onto seg1's line
+    and ordering them to match seg1's parameter direction (0→1), so a segment
+    stored in the opposite direction to its partner still produces a straight
+    (not twisted) centerline. source_indices are the two indices into the input
+    `segments` list that were paired, so callers can look up their own
+    per-segment metadata (e.g. layer name).
     """
     n = len(segments)
     used = set()
@@ -556,10 +576,22 @@ def pair_parallel_segments(
             used.add(i)
             used.add(best_j)
             p2a, p2b = segments[best_j]
-            same_order = distance(p1a, p2a) + distance(p1b, p2b)
-            crossed = distance(p1a, p2b) + distance(p1b, p2a)
-            if crossed < same_order:
-                p2a, p2b = p2b, p2a
+            
+            # ROBUST ENDPOINT CORRESPONDENCE:
+            # Project both endpoints of seg2 onto seg1's line, get parameters t
+            def proj_param(pt, l1, l2):
+                dx, dy = l2[0] - l1[0], l2[1] - l1[1]
+                l2_sq = dx*dx + dy*dy
+                if l2_sq == 0: return 0.0
+                return ((pt[0]-l1[0])*dx + (pt[1]-l1[1])*dy) / l2_sq
+            
+            t2a = proj_param(p2a, p1a, p1b)
+            t2b = proj_param(p2b, p1a, p1b)
+            
+            # Order seg2 endpoints to match seg1's parameter direction (0→1)
+            if t2a > t2b:
+                p2a, p2b = p2b, p2a  # swap so p2a corresponds to p1a (t≈0), p2b to p1b (t≈1)
+            
             cl_p1 = ((p1a[0] + p2a[0]) / 2, (p1a[1] + p2a[1]) / 2)
             cl_p2 = ((p1b[0] + p2b[0]) / 2, (p1b[1] + p2b[1]) / 2)
             pairs.append({
