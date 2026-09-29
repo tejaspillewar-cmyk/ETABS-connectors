@@ -20,8 +20,8 @@ asked to do two things at once, and the window stays responsive.
 import io
 import os
 import queue
+import subprocess
 import sys
-import threading
 import time
 import traceback
 import tkinter as tk
@@ -98,27 +98,7 @@ UI_POLL_MS = 40          # how often the Tk thread drains the worker's queue
 NS = {}
 
 
-def _etabs_helper():
-    """Create the ETABS COM helper, explaining the usual failure.
-
-    Both connect paths start here. comtypes generates its ETABSv1 wrapper on
-    first use; on a machine where ETABS was never installed (or registered
-    badly) that surfaces as an AttributeError from deep inside comtypes, which
-    tells the user nothing.
-    """
-    import comtypes.client
-    try:
-        helper = comtypes.client.CreateObject("ETABSv1.Helper")
-        import comtypes.gen.ETABSv1
-        return helper.QueryInterface(comtypes.gen.ETABSv1.cHelper)
-    except Exception as exc:
-        raise RuntimeError(
-            "Could not load the ETABS COM API (ETABSv1.Helper).\n\n"
-            "This usually means ETABS is not installed on this machine, or "
-            "its COM registration is damaged. Reinstalling or repairing ETABS "
-            "normally fixes it.\n\n"
-            f"Original error: {exc}") from exc
-
+from etabs_worker import etabs_helper as _etabs_helper
 
 NS["_etabs_helper"] = _etabs_helper
 
@@ -130,11 +110,24 @@ NS["_etabs_helper"] = _etabs_helper
 LAUNCH_CODE = (
     "helper = _etabs_helper()\n"
     "import comtypes.gen.ETABSv1\n"
+    "import app_paths as _app_paths, time as _time\n"
+    "_before_pids = {p['pid'] for p in _app_paths.running_etabs()}\n"
     "print('Launching ETABS from:', etabs_path)\n"
     "myETABSObject = helper.CreateObject(etabs_path)\n"
     "myETABSObject.ApplicationStart()\n"
     "myETABSObject = myETABSObject.QueryInterface(comtypes.gen.ETABSv1.cOAPI)\n"
     "SapModel = myETABSObject.SapModel\n"
+    # No direct API for "what PID did I just start" -- diff the process list
+    # before/after so other tools (e.g. the DXF Model Builder card) can
+    # attach to this exact instance without the user attaching a second time.
+    "_new_pids = []\n"
+    "for _ in range(20):\n"
+    "    _new_pids = [p['pid'] for p in _app_paths.running_etabs() if p['pid'] not in _before_pids]\n"
+    "    if _new_pids:\n"
+    "        break\n"
+    "    _time.sleep(0.25)\n"
+    "if len(_new_pids) == 1:\n"
+    "    connected_pid = _new_pids[0]\n"
     "print('Connected. Open your .edb model in the ETABS window.')"
 )
 
@@ -154,6 +147,10 @@ ATTACH_CODE = (
     "        'Most often the model is still loading -- wait for ETABS to finish opening it and try again.')\n"
     "myETABSObject = myETABSObject.QueryInterface(comtypes.gen.ETABSv1.cOAPI)\n"
     "SapModel = myETABSObject.SapModel\n"
+    # Separate from attach_pid (which stays popped so the next Attach click
+    # always re-prompts): this is "the PID we're currently connected to",
+    # for other tools -- e.g. the DXF Model Builder card -- to read.
+    "connected_pid = pid\n"
     "print('Attached. Active file:', SapModel.GetModelFilename() or '(none)')"
 )
 
@@ -209,6 +206,18 @@ CELLS = [
         "actions": [("Run", "inventory")],
         "is_connect": False,
     },
+    {
+        "id": "cell_4",
+        "label": "04",
+        "title": "DXF Model Builder",
+        "subtitle": "Import a floorplan DXF and draw the model",
+        "detail": "Opens the DXF Model Builder window, already attached to "
+                  "this same ETABS instance. Classify layers, preview the "
+                  "plan, and draw walls/slabs/beams/columns into ETABS.",
+        "accent": AMBER,
+        "actions": [("Open", "open_dxf_builder")],
+        "is_connect": False,
+    },
 ]
 
 CODE_BY_KEY = {
@@ -221,49 +230,10 @@ CODE_BY_KEY = {
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ETABS worker -- one thread, one COM apartment, one job at a time
+# (moved to etabs_worker.py so dxf_model_builder.py can share it)
 # ═════════════════════════════════════════════════════════════════════════════
 
-class EtabsWorker:
-    """Serialises every ETABS call onto a single CoInitialize'd thread."""
-
-    def __init__(self):
-        self._jobs = queue.Queue()
-        self._thread = threading.Thread(target=self._loop, daemon=True,
-                                        name="etabs-worker")
-        self._thread.start()
-
-    def submit(self, fn, on_done=None):
-        """Queue fn() for the worker thread.
-
-        on_done(ok, result_or_exception, elapsed_seconds) is called back on
-        the worker thread; marshal it to Tk with .after().
-        """
-        self._jobs.put((fn, on_done))
-
-    def _loop(self):
-        try:
-            import comtypes
-            comtypes.CoInitialize()
-        except Exception:
-            pass  # non-Windows, or comtypes missing -- jobs will report it
-
-        while True:
-            fn, on_done = self._jobs.get()
-            started = time.perf_counter()
-            try:
-                result = fn()
-                ok, payload = True, result
-            except Exception as exc:
-                ok, payload = False, exc
-            elapsed = time.perf_counter() - started
-            if on_done is not None:
-                try:
-                    on_done(ok, payload, elapsed)
-                except Exception:
-                    # Not print_exc(): stderr is None under pythonw, so that
-                    # would raise a second error on top of this one.
-                    _write_crash_log(traceback.format_exc())
-            self._jobs.task_done()
+from etabs_worker import EtabsWorker
 
 
 class ChooseInstance(tk.Toplevel):
@@ -767,13 +737,14 @@ class App(tk.Tk):
         self._refresh_etabs_label()
 
     def _stacked_pair(self, parent, col, cell_top, cell_bottom):
-        """Compact cards stacked in one grid column: 02, 03, and pier relabel."""
+        """Compact cards stacked in one grid column: 02, 03, pier relabel, 04."""
         wrap = tk.Frame(parent, bg=BG)
         wrap.grid(row=0, column=col, padx=(8, 0), sticky="nsew")
         wrap.columnconfigure(0, weight=1)
         self._mini_card(wrap, 0, cell_top)
         self._mini_card(wrap, 1, cell_bottom)
         self._pier_mini_card(wrap, 2)
+        self._mini_card(wrap, 3, CELLS[3])
 
     def _mini_card(self, parent, row, cell):
         """A compact variant of _card for the stacked column."""
@@ -1439,6 +1410,39 @@ class App(tk.Tk):
         self._log(f"  Logs         : {app_paths.logs_dir()}")
         self._log("=" * 60, "info")
 
+    def _open_dxf_builder(self):
+        """Launch the standalone DXF Model Builder, attached to this ETABS.
+
+        A separate process, not a Tk panel: it embeds a Qt CADViewer, and
+        Qt/Tk can't share one window. See dxf_model_builder.py. It attaches
+        itself using the same --pid convention main() already understands
+        for this app (see the bottom of this file).
+        """
+        pid = NS.get("connected_pid")
+        if not pid:
+            self._log("")
+            self._log("Connect to ETABS first (card 01 -- Launch or Attach), "
+                      "then open the DXF Model Builder.", "warn")
+            return
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        script = os.path.join(here, "dxf_model_builder.py")
+        if not os.path.isfile(script):
+            self._log(f"dxf_model_builder.py not found next to this app: {script}", "err")
+            return
+
+        python = sys.executable
+        if python.lower().endswith("python.exe"):
+            pythonw = python[:-len("python.exe")] + "pythonw.exe"
+            if os.path.isfile(pythonw):
+                python = pythonw
+
+        try:
+            subprocess.Popen([python, script, "--pid", str(pid)], cwd=here)
+            self._log(f"Opened DXF Model Builder, attached to ETABS PID {pid}.", "ok")
+        except OSError as exc:
+            self._log(f"Could not launch DXF Model Builder: {exc}", "err")
+
     # ── Cell execution ───────────────────────────────────────────────────────
 
     def _run_cell(self, cell, key):
@@ -1447,6 +1451,9 @@ class App(tk.Tk):
         # may have to ask. Those helpers call back here once settled.
         if key == "diagnose":
             self._diagnose()
+            return
+        if key == "open_dxf_builder":
+            self._open_dxf_builder()
             return
         if key == "attach" and not NS.get("attach_pid"):
             self._choose_attach_target(cell)

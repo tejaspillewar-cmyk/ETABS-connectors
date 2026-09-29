@@ -8,4 +8,5 @@ comtypes>=1.4.16     # COM bridge to the ETABS OAPI (ETABSv1.Helper)
 psutil>=7.2.2        # finds the running ETABS.exe process to attach to
 pandas>=3.0.5        # result tables and the Excel writer front-end
 openpyxl>=3.1.5      # .xlsx engine used by pandas for the FDR report
-ezdxf>=1.4.4         # optional: "Export DXF" button only
+ezdxf>=1.4.4         # DXF read/write; "Export DXF" button and dxf_model_builder.py
+PySide6>=6.11.2      # Qt GUI for dxf_model_builder.py (embeds ezdxf's CADViewer)
