@@ -185,6 +185,17 @@ def _snap_members_to_graph(members, graph, result):
     
     CRITICAL: Snapping only moves endpoints ALONG the member's original axis.
     Direction (angle) is NEVER changed.
+    
+    T-JUNCTION LOGIC:
+    - If member A's endpoint projects to member B's MID-SPAN (t in [0.15, 0.85])
+      and member B's endpoints do NOT project to A's mid-span:
+      -> A is the STEM of a T, B is the TOP
+      -> EXTEND A along its axis to meet B's centerline
+    - If member B's endpoint projects to A's mid-span and A's doesn't to B's:
+      -> B is the stem, A is the top
+      -> DON'T move A (B will be extended when its slot is processed)
+    - If both project to each other's mid-span: cross junction
+      -> Extend both to intersection
     """
     n = len(members)
     if n < 2:
@@ -244,8 +255,8 @@ def _snap_members_to_graph(members, graph, result):
                 members[mi]["p2"] = target
         result.corners_snapped += 1
 
-    # T-junctions: endpoints not merged with another endpoint -- snap to
-    # another member's SPAN along the endpoint's member axis (preserves direction)
+    # T-junctions: endpoints not merged with another endpoint -- 
+    # EXTEND terminating member to meet the through-member's centerline
     for idx in range(len(slots)):
         if idx in matched_slots:
             continue
@@ -258,25 +269,85 @@ def _snap_members_to_graph(members, graph, result):
         dir_vec = (math.cos(angle_rad), math.sin(angle_rad))
         
         best = None
-        best_dist = float('inf')
+        best_score = float('inf')
+        
         for j, m in enumerate(members):
             if j == mi:
                 continue
+            
             # Project our endpoint onto the other member's span
-            proj, dist = closest_point_on_segment(pt, m["p1"], m["p2"])
-            # Skip if projection lands at other member's endpoint (handled above)
+            proj, dist_to_line = closest_point_on_segment(pt, m["p1"], m["p2"])
+            
+            # Skip if projection lands at other member's endpoint (handled by corner clustering)
             near_end = distance(proj, m["p1"]) < 1.0 or distance(proj, m["p2"]) < 1.0
             if near_end:
                 continue
+            
             tol = _snap_tolerance(w, m["half_width"])
-            if dist <= tol and dist < best_dist:
-                # CRITICAL: Move our endpoint along ITS OWN axis to reach the projection
-                # This preserves our member's direction
+            if dist_to_line > tol:
+                continue
+            
+            # KEY CHANGE: Determine if WE are the terminating member or the through-member
+            # We are terminating if our endpoint is near the other member's MID-SPAN
+            # We are through if the other's endpoint is near OUR mid-span
+            
+            # Parameter of projection on other member (0 to 1)
+            t_on_other = project_point_on_line(proj, m["p1"], m["p2"])
+            
+            # Parameter of other member's endpoints on OUR line
+            # Create a point far along our direction for projection
+            far_pt = (pt[0] + dir_vec[0] * 10000, pt[1] + dir_vec[1] * 10000)
+            t_other_p1_on_us = project_point_on_line(m["p1"], pt, far_pt)
+            t_other_p2_on_us = project_point_on_line(m["p2"], pt, far_pt)
+            
+            # Other member spans across our line if its endpoints project to opposite sides
+            other_spans_us = (t_other_p1_on_us < 0 and t_other_p2_on_us > 0) or \
+                            (t_other_p1_on_us > 0 and t_other_p2_on_us < 0)
+            
+            # Our endpoint projects to other's mid-span (0.15 to 0.85) = we terminate on them
+            we_terminate = 0.15 <= t_on_other <= 0.85
+            
+            # Other's endpoint projects to our mid-span = they terminate on us
+            they_terminate = False
+            # Check if either of their endpoints is near our mid-span
+            our_mid = ((members[mi]["p1"][0] + members[mi]["p2"][0])/2,
+                       (members[mi]["p1"][1] + members[mi]["p2"][1])/2)
+            if distance(m["p1"], our_mid) < tol * 2 or distance(m["p2"], our_mid) < tol * 2:
+                they_terminate = True
+            
+            # DECISION LOGIC:
+            if we_terminate and not they_terminate:
+                # WE are the stem of a T, THEY are the top - EXTEND US to meet them
+                # Move our endpoint along OUR axis to the projection point
                 t = (proj[0] - pt[0]) * dir_vec[0] + (proj[1] - pt[1]) * dir_vec[1]
                 snapped_pt = (pt[0] + t * dir_vec[0], pt[1] + t * dir_vec[1])
-                # Verify the snapped point is close to the projection
-                if distance(snapped_pt, proj) <= tol * 1.5:
-                    best = (snapped_pt, dist)
+                score = dist_to_line  # prefer closer
+                if score < best_score:
+                    best_score = score
+                    best = (snapped_pt, "extend_to_meet")
+                    
+            elif they_terminate and not we_terminate:
+                # THEY are the stem, WE are the top - DON'T MOVE US
+                # But we should extend THEM to meet us (handled when processing their slot)
+                continue
+                
+            elif we_terminate and they_terminate:
+                # Both near each other's mid-span = cross junction
+                # Extend both to intersection (handled by corner clustering ideally)
+                t = (proj[0] - pt[0]) * dir_vec[0] + (proj[1] - pt[1]) * dir_vec[1]
+                snapped_pt = (pt[0] + t * dir_vec[0], pt[1] + t * dir_vec[1])
+                score = dist_to_line + 100  # slight penalty
+                if score < best_score:
+                    best_score = score
+                    best = (snapped_pt, "cross")
+            else:
+                # Ambiguous - fallback to closest projection along our axis
+                t = (proj[0] - pt[0]) * dir_vec[0] + (proj[1] - pt[1]) * dir_vec[1]
+                snapped_pt = (pt[0] + t * dir_vec[0], pt[1] + t * dir_vec[1])
+                score = dist_to_line + 1000
+                if score < best_score:
+                    best_score = score
+                    best = (snapped_pt, "fallback")
         
         if best is not None:
             if which == 0:

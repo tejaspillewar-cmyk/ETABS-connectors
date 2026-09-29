@@ -314,8 +314,8 @@ def compute_medial_axis(vertices: list[tuple[float, float]],
     bbox_w = max_x - min_x
     bbox_h = max_y - min_y
     
-    # Adaptive grid resolution based on polygon size
-    grid_size = max(20, min(100, int(max(bbox_w, bbox_h) / 50)))
+    # Adaptive grid resolution based on polygon size - INCREASED for better accuracy
+    grid_size = max(50, min(200, int(max(bbox_w, bbox_h) / 20)))
     cell_size = max(bbox_w, bbox_h) / grid_size
     
     # Compute distance field on grid
