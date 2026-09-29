@@ -1,20 +1,23 @@
 """
 Post-extraction, pre-drawing connectivity pass.
 
-Extraction measures every wall/beam/slab in isolation, so elements that
+Extraction measures every wall/beam/slab/column in isolation, so elements that
 should share a structural node in ETABS often don't actually touch:
   - Two walls meeting at a bent/L/T corner have independently-measured
     centerlines that stop short of, or overlap, the true corner.
   - A beam ending at a shear wall stops wherever the DXF geometry happened
     to end, not necessarily exactly on the wall's centerline.
+  - A beam ending at a column stops at the column face, not its centerline.
   - A slab is drawn to its raw DXF boundary, usually the clear span between
     beam/wall faces, not the beam/wall centerline -- leaving a gap.
 
 snap_connections() fixes all three by:
-  1. Snapping wall/beam endpoints together at shared corners and T-junctions
+  1. Building a structural graph: columns first (defining grid nodes), then
+     walls/beams snapping endpoints to column nodes and to each other.
+  2. Snapping wall/beam endpoints together at shared corners and T-junctions
      (WITHOUT changing member directions - only extending/shortening along
      their original axis)
-  2. Expanding slab edges OUTWARD along their original edge normals to the
+  3. Expanding slab edges OUTWARD along their original edge normals to the
      centerline of the bounding beams/walls (keeping each edge parallel to
      its original direction)
 
@@ -40,6 +43,7 @@ class _ConnResult:
     def __init__(self):
         self.corners_snapped = 0     # wall-wall, wall-beam, or beam-beam endpoint clusters merged
         self.t_junctions = 0         # endpoints snapped onto another member's span
+        self.column_snaps = 0        # beam/wall endpoints snapped to column centroids
         self.slab_edges_expanded = 0
 
 
@@ -71,12 +75,113 @@ class _UnionFind:
             self.parent[ra] = rb
 
 
-# ── wall/beam endpoint snapping (PRESERVES DIRECTION) ──────────────────────
+# ── Structural Graph: columns define nodes, members snap to them ───────────
 
-def _snap_members(members, result):
+class _StructuralGraph:
     """
-    members: list of dicts {"p1", "p2", "half_width", "angle_deg"}, mutated in place.
-    Endpoint slots are indexed 0..2n-1 (2*i = p1 of member i, 2*i+1 = p2 of member i).
+    Nodes = column centroids + wall/beam endpoints (after snapping).
+    Edges = wall/beam centerlines between nodes.
+    
+    Columns are added FIRST as fixed nodes. Then walls/beams snap their
+    endpoints to the nearest column node (if within tolerance) or to each other.
+    """
+    
+    def __init__(self, snap_tolerance_min=150, snap_tolerance_max=750, snap_factor=1.5):
+        self.nodes = []           # list of (x, y, node_id, connected_elements_set)
+        self.edges = []           # list of (node_id_1, node_id_2, element_type, element_ref)
+        self._next_node_id = 0
+        self.snap_tolerance_min = snap_tolerance_min
+        self.snap_tolerance_max = snap_tolerance_max
+        self.snap_factor = snap_factor
+        self.column_node_ids = set()  # node_ids that came from columns (fixed)
+    
+    def _snap_tolerance(self, width_a, width_b):
+        return max(self.snap_tolerance_min, min(self.snap_tolerance_max, self.snap_factor * max(width_a, width_b)))
+    
+    def add_column(self, col, col_id):
+        """Add column centroid as a fixed structural node."""
+        cx, cy = col.centroid
+        # Check if very close to existing column node (duplicate column)
+        for node in self.nodes:
+            nx, ny, nid, _ = node
+            if distance((cx, cy), (nx, ny)) < 50.0:  # 50mm = essentially same point
+                return nid
+        nid = self._next_node_id
+        self._next_node_id += 1
+        self.nodes.append([cx, cy, nid, {("column", col_id)}])
+        self.column_node_ids.add(nid)
+        return nid
+    
+    def get_node_position(self, node_id):
+        for node in self.nodes:
+            if node[2] == node_id:
+                return (node[0], node[1])
+        return None
+    
+    def find_nearest_node(self, pt, exclude_column_nodes=False, max_dist=None):
+        """Find nearest node to pt within max_dist."""
+        best_node = None
+        best_dist = max_dist if max_dist is not None else float('inf')
+        for node in self.nodes:
+            if exclude_column_nodes and node[2] in self.column_node_ids:
+                continue
+            nx, ny, nid, _ = node
+            d = distance(pt, (nx, ny))
+            if d < best_dist:
+                best_dist = d
+                best_node = node
+        return best_node, best_dist
+    
+    def snap_point_to_graph(self, pt, element_type, element_ref, element_width, element_id):
+        """
+        Snap a point to the structural graph:
+        1. First try column nodes (highest priority - they define the grid)
+        2. Then try other member endpoints
+        3. If no snap, create new node
+        Returns (node_id, snapped_point)
+        """
+        # 1. Try column nodes first
+        for node in self.nodes:
+            if node[2] not in self.column_node_ids:
+                continue
+            nx, ny, nid, _ = node
+            d = distance(pt, (nx, ny))
+            tol = self._snap_tolerance(element_width, 300)  # column width ~300mm typical
+            if d <= tol:
+                node[3].add((element_type, element_ref))
+                return nid, (nx, ny)
+        
+        # 2. Try other nodes (member endpoints)
+        best_node, best_dist = self.find_nearest_node(pt, max_dist=self._snap_tolerance(element_width, element_width))
+        if best_node:
+            nid = best_node[2]
+            snapped = (best_node[0], best_node[1])
+            best_node[3].add((element_type, element_ref))
+            return nid, snapped
+        
+        # 3. Create new node
+        nid = self._next_node_id
+        self._next_node_id += 1
+        self.nodes.append([pt[0], pt[1], nid, {(element_type, element_ref)}])
+        return nid, pt
+    
+    def add_member(self, element_type, element_ref, p1, p2, half_width, angle_deg, element_id):
+        """Add a wall/beam member, snapping its endpoints to the graph."""
+        n1, snapped_p1 = self.snap_point_to_graph(p1, element_type, element_ref, half_width, element_id)
+        n2, snapped_p2 = self.snap_point_to_graph(p2, element_type, element_ref, half_width, element_id)
+        
+        # If both endpoints snapped to same node, this member is degenerate
+        if n1 == n2:
+            return n1, n2, snapped_p1, snapped_p2, True
+        
+        self.edges.append((n1, n2, element_type, element_ref))
+        return n1, n2, snapped_p1, snapped_p2, False
+
+
+def _snap_members_to_graph(members, graph, result):
+    """
+    Second pass: snap member endpoints to each other (corners and T-junctions)
+    for endpoints that didn't snap to columns.
     
     CRITICAL: Snapping only moves endpoints ALONG the member's original axis.
     Direction (angle) is NEVER changed.
@@ -85,10 +190,30 @@ def _snap_members(members, result):
     if n < 2:
         return
 
-    slots = []  # (member_index, which, point, half_width, angle_deg)
+    # Collect endpoints that are NOT already at column nodes
+    slots = []  # (member_index, which, point, half_width, angle_deg, node_id)
     for i, m in enumerate(members):
-        slots.append((i, 0, m["p1"], m["half_width"], m["angle_deg"]))
-        slots.append((i, 1, m["p2"], m["half_width"], m["angle_deg"]))
+        # Check if p1 is at a column node
+        p1_at_column = False
+        for node in graph.nodes:
+            if node[2] in graph.column_node_ids:
+                if distance(m["p1"], (node[0], node[1])) < 1.0:
+                    p1_at_column = True
+                    break
+        if not p1_at_column:
+            slots.append((i, 0, m["p1"], m["half_width"], m["angle_deg"]))
+        
+        p2_at_column = False
+        for node in graph.nodes:
+            if node[2] in graph.column_node_ids:
+                if distance(m["p2"], (node[0], node[1])) < 1.0:
+                    p2_at_column = True
+                    break
+        if not p2_at_column:
+            slots.append((i, 1, m["p2"], m["half_width"], m["angle_deg"]))
+
+    if len(slots) < 2:
+        return
 
     uf = _UnionFind(len(slots))
     for a in range(len(slots)):
@@ -110,7 +235,6 @@ def _snap_members(members, result):
         if len(idxs) < 2:
             continue
         matched_slots.update(idxs)
-        # Compute target as average of cluster points (corner junction)
         target = _cluster_target(idxs, slots, members)
         for idx in idxs:
             mi, which, _, _, _ = slots[idx]
@@ -148,8 +272,6 @@ def _snap_members(members, result):
             if dist <= tol and dist < best_dist:
                 # CRITICAL: Move our endpoint along ITS OWN axis to reach the projection
                 # This preserves our member's direction
-                # Find t such that: pt + t * dir_vec = proj (approximately)
-                # t = (proj - pt) dot dir_vec
                 t = (proj[0] - pt[0]) * dir_vec[0] + (proj[1] - pt[1]) * dir_vec[1]
                 snapped_pt = (pt[0] + t * dir_vec[0], pt[1] + t * dir_vec[1])
                 # Verify the snapped point is close to the projection
@@ -216,7 +338,6 @@ def _expand_slab(vertices, members, result):
 
     # For each edge, find the target member centerline and compute offset distance
     edge_offsets = [None] * n  # distance to expand each edge (positive = outward)
-    edge_target_lines = [None] * n  # the member centerline (p1, p2) for reference
     
     for i in range(n):
         a, b = vertices[i], vertices[(i + 1) % n]
@@ -255,11 +376,10 @@ def _expand_slab(vertices, members, result):
             
             if perp_gap < best_perp_gap:
                 best_perp_gap = perp_gap
-                best = (gap, (m["p1"], m["p2"]))
+                best = gap
         
         if best is not None:
-            edge_offsets[i] = best[0]
-            edge_target_lines[i] = best[1]
+            edge_offsets[i] = best
 
     if not any(edge_offsets):
         return vertices
@@ -300,9 +420,6 @@ def _expand_slab(vertices, members, result):
         offset2 = edge_offsets[i] if edge_offsets[i] is not None else 0.0
         
         # Offset the two edge lines
-        # Line 1: a1 + offset1*norm1 + t*dir1
-        # Line 2: a2 + offset2*norm2 + s*dir2
-        # Solve for intersection
         p1 = (a1[0] + offset1 * norm1[0], a1[1] + offset1 * norm1[1])
         p2 = (a2[0] + offset2 * norm2[0], a2[1] + offset2 * norm2[1])
         
@@ -310,7 +427,6 @@ def _expand_slab(vertices, members, result):
                                p2, (p2[0] + dir2[0], p2[1] + dir2[1]))
         
         if pt is not None:
-            # Safety: limit how far a vertex can move
             max_move = SLAB_EXPAND_MAX_GAP_MM * 3
             if distance(pt, vertices[i]) <= max_move:
                 new_vertices.append(pt)
@@ -342,30 +458,54 @@ def snap_connections(parsed: dict, log=lambda m: None) -> dict:
 
     eligible_walls = [w for w in walls if not w.warnings and w.thickness_mm > 0 and w.length_m > 0]
     eligible_beams = [b for b in beams if not b.warnings and b.width_mm > 0 and b.length_m > 0]
+    eligible_columns = [c for c in columns if not c.warnings and c.width_mm > 0 and c.depth_mm > 0]
 
-    # Build member list using stored p1/p2 directly
+    # Build structural graph: columns FIRST (they define the grid nodes)
+    graph = _StructuralGraph(NODE_SNAP_MIN_MM, NODE_SNAP_MAX_MM, NODE_SNAP_FACTOR)
+    
+    # Add columns as fixed nodes
+    for col in eligible_columns:
+        graph.add_column(col, id(col))
+    
+    # Add walls and beams, snapping endpoints to column nodes
     members = []
     for w in eligible_walls:
-        members.append({
-            "p1": w.p1, "p2": w.p2, 
-            "half_width": w.thickness_mm / 2.0, 
-            "angle_deg": w.angle_deg,
-            "kind": "wall", "entry": w
-        })
+        n1, n2, sp1, sp2, degenerate = graph.add_member(
+            "wall", w, w.p1, w.p2, w.thickness_mm / 2.0, w.angle_deg, id(w)
+        )
+        if not degenerate:
+            members.append({
+                "p1": sp1, "p2": sp2, 
+                "half_width": w.thickness_mm / 2.0, 
+                "angle_deg": w.angle_deg,
+                "kind": "wall", "entry": w,
+                "graph_n1": n1, "graph_n2": n2
+            })
+        else:
+            result.column_snaps += 1  # both ends at same column = degenerate
+    
     for b in eligible_beams:
-        members.append({
-            "p1": b.p1, "p2": b.p2, 
-            "half_width": b.width_mm / 2.0, 
-            "angle_deg": b.angle_deg,
-            "kind": "beam", "entry": b
-        })
+        n1, n2, sp1, sp2, degenerate = graph.add_member(
+            "beam", b, b.p1, b.p2, b.width_mm / 2.0, b.angle_deg, id(b)
+        )
+        if not degenerate:
+            members.append({
+                "p1": sp1, "p2": sp2, 
+                "half_width": b.width_mm / 2.0, 
+                "angle_deg": b.angle_deg,
+                "kind": "beam", "entry": b,
+                "graph_n1": n1, "graph_n2": n2
+            })
+        else:
+            result.column_snaps += 1
 
-    _snap_members(members, result)
+    # Second pass: snap member endpoints to each other (corners/T-junctions)
+    _snap_members_to_graph(members, graph, result)
 
     MIN_SNAPPED_LENGTH_M = 0.05
 
+    # Rebuild walls with snapped endpoints
     new_walls = []
-    new_beams = []
     member_by_entry = {id(m["entry"]): m for m in members}
     for w in walls:
         m = member_by_entry.get(id(w))
@@ -383,6 +523,9 @@ def snap_connections(parsed: dict, log=lambda m: None) -> dict:
                                   p1=m["p1"], p2=m["p2"],
                                   centroid=(round(centroid[0], 1), round(centroid[1], 1)),
                                   angle_deg=round(angle_deg, 2), length_m=round(length_m, 3), warnings=warnings))
+
+    # Rebuild beams with snapped endpoints
+    new_beams = []
     for b in beams:
         m = member_by_entry.get(id(b))
         if m is None:
@@ -400,6 +543,10 @@ def snap_connections(parsed: dict, log=lambda m: None) -> dict:
                                   centroid=(round(centroid[0], 1), round(centroid[1], 1)),
                                   angle_deg=round(angle_deg, 2), length_m=round(length_m, 3), warnings=warnings))
 
+    # Columns stay at their centroids (they define the grid)
+    new_columns = columns  # unchanged
+
+    # Slabs: expand to snapped member centerlines
     new_slabs = []
     for s in slabs:
         if s.warnings or not s.vertices:
@@ -417,7 +564,8 @@ def snap_connections(parsed: dict, log=lambda m: None) -> dict:
 
     log(f"Connectivity: {result.corners_snapped} corner(s) snapped, "
         f"{result.t_junctions} T-junction(s) connected, "
+        f"{result.column_snaps} beam/wall-to-column snaps, "
         f"{result.slab_edges_expanded} slab edge(s) expanded to member centerlines "
         f"(all directions preserved).")
 
-    return {"slabs": new_slabs, "walls": new_walls, "beams": new_beams, "columns": columns}
+    return {"slabs": new_slabs, "walls": new_walls, "beams": new_beams, "columns": new_columns}
