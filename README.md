@@ -125,6 +125,27 @@ progress. When it finishes, the export buttons switch on.
 
 `cad_export/` is created automatically. It is disposable output — safe to delete.
 
+### Design review report (card "Design Review Report")
+
+Attach to an analysed model, then:
+
+1. **Cases...** (once per model): say which load cases are EQ, SPEC, gust wind and static wind, which are the modal,
+   dead and live cases, and confirm the SLS / ULS stiffness-modifier table. Saved as `<model>.report_mapping.json`.
+2. **Generate**: checks the model and shows the plan (and how many analysis runs it needs) before doing anything.
+   It reads the stiffness state the model is already in, and for the missing state it saves a working copy in a
+   `report_work` folder, writes the modifiers on every object, runs the analysis and reads the results. **Your original
+   file is not modified**; ETABS ends up showing the working copy.
+3. The finished report **opens in your browser** (report app in `../etabs-report`, built with `npm run build`) with every
+   value filled in, an automatic-checks panel and the plan with corner points 1 to 4. Fix anything, then Export Excel.
+   Keep this window open while you work in the report.
+
+**Quick read** is the read-only variant: it reads the results as they are, without any re-run (values are then not
+separated into SLS and ULS).
+
+How every value is obtained, and exactly how the SLS and ULS runs work, is in `docs/REPORT_EXTRACTION_EXPLAINED.md`.
+The decisions behind it are in `docs/report_automation_questions.md`. Command-line quick read:
+`python report_extractor.py <ETABS pid> out.json`. Offline tests: `python -m pytest tests/test_report_logic.py`.
+
 ---
 
 ## 5. Why there is a Launch button at all
@@ -325,6 +346,11 @@ file or build step to go stale.
 |---|---|
 | `etabs_gui.pyw` | The application. Entry point. |
 | `fdr_tool.py` | All engineering logic and exporters. |
+| `report_extractor.py` | Case mapping and read-only extraction of the design review report inputs. |
+| `report_modifiers.py` | SLS / ULS stiffness modifiers per object, state detection, working copy, analysis run. |
+| `report_pipeline.py` | The report job in two phases (prepare, execute). |
+| `report_plan_image.py` | Plan picture with the four torsion corner points. |
+| `report_server.py` | Local server that opens the report in the report app. |
 | `app_paths.py` | Settings, crash-log location, and ETABS discovery. |
 | `requirements.txt` | Python dependencies. |
 | `PyLauncherPlugin/` | Optional ETABS menu launcher (VB), added manually via Tools → Add/Show Plugins. |

@@ -361,6 +361,150 @@ class ChooseMode(tk.Toplevel):
         self.destroy()
 
 
+class ReportMappingDialog(tk.Toplevel):
+    """Which load cases are EQ, SPEC, gust wind and static wind, plus stories and modifier tables."""
+
+    IGNORE = "(ignore)"
+    AUTO = "(auto)"
+
+    def __init__(self, parent, cases, stories, mapping):
+        super().__init__(parent)
+        import report_extractor as rx
+        self._rx = rx
+        self.result = None
+        self.title("Report case mapping")
+        self.configure(bg=BG)
+        self.transient(parent)
+        self.geometry("760x740")
+        names = [c[0] for c in cases]
+        self.var_modal = tk.StringVar(value=mapping.modal_case)
+        self.var_dead = tk.StringVar(value=mapping.dead_case)
+        self.var_live = tk.StringVar(value=mapping.live_case)
+        self.var_ground = tk.StringVar(value=mapping.ground_story or self.AUTO)
+        self.var_typical = tk.StringVar(value=mapping.typical_story or self.AUTO)
+        self.var_J = tk.BooleanVar(value=mapping.scale_frame_J)
+        self._base = mapping
+        titles = [rx.ROLE_TITLES[k] for k in rx.ROLE_KEYS]
+        self._title_to_key = {rx.ROLE_TITLES[k]: k for k in rx.ROLE_KEYS}
+        role_of = {}
+        for k in rx.ROLE_KEYS:
+            for c in getattr(mapping, k):
+                role_of[c] = rx.ROLE_TITLES[k]
+        self.var_role = {n: tk.StringVar(value=role_of.get(n, self.IGNORE)) for n in names}
+
+        tk.Label(self, text="Report case mapping", font=parent.f_title, bg=BG,
+                 fg=FG).pack(anchor="w", padx=18, pady=(14, 2))
+        tk.Label(self, text="Tell the report which load case is which. The guess below comes from "
+                            "the case types and names; correct anything that is wrong. Saved next to the model.",
+                 font=parent.f_detail, bg=BG, fg=FG_MUTED, wraplength=720,
+                 justify="left").pack(anchor="w", padx=18, pady=(0, 8))
+
+        single = tk.Frame(self, bg=BG)
+        single.pack(fill="x", padx=18)
+        for i, (label, var) in enumerate((("Modal case", self.var_modal),
+                                          ("Dead load case", self.var_dead),
+                                          ("Live load case", self.var_live))):
+            tk.Label(single, text=label, font=parent.f_field, bg=BG, fg=FG_DIM).grid(
+                row=0, column=2 * i, sticky="w", padx=(0 if i == 0 else 14, 6))
+            ttk.Combobox(single, textvariable=var, values=names, width=14,
+                         state="readonly").grid(row=0, column=2 * i + 1)
+
+        box = tk.Frame(self, bg=BG)
+        box.pack(fill="both", expand=True, padx=18, pady=10)
+        canvas = tk.Canvas(box, bg=SURFACE, highlightthickness=0, height=260)
+        sb = ttk.Scrollbar(box, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=SURFACE)
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        for r, (n, kind, flagged) in enumerate(cases):
+            tk.Label(inner, text=n, font=parent.f_field, bg=SURFACE, fg=FG, width=16,
+                     anchor="w").grid(row=r, column=0, padx=(8, 4), pady=2, sticky="w")
+            tk.Label(inner, text=kind + ("" if flagged else " (not run)"), font=parent.f_detail,
+                     bg=SURFACE, fg=FG_MUTED, width=22, anchor="w").grid(row=r, column=1, pady=2)
+            ttk.Combobox(inner, textvariable=self.var_role[n], width=30, state="readonly",
+                         values=[self.IGNORE] + titles).grid(row=r, column=2, padx=(4, 8), pady=2)
+
+        st = tk.Frame(self, bg=BG)
+        st.pack(fill="x", padx=18)
+        for i, (label, var) in enumerate((("Ground story", self.var_ground),
+                                          ("Typical story", self.var_typical))):
+            tk.Label(st, text=label, font=parent.f_field, bg=BG, fg=FG_DIM).grid(
+                row=0, column=2 * i, sticky="w", padx=(0 if i == 0 else 14, 6))
+            ttk.Combobox(st, textvariable=var, values=[self.AUTO] + list(stories), width=14,
+                         state="readonly").grid(row=0, column=2 * i + 1)
+
+        tk.Label(self, text="Stiffness modifiers applied for the SLS and ULS runs",
+                 font=parent.f_field, bg=BG, fg=FG).pack(anchor="w", padx=18, pady=(12, 2))
+        mods = tk.Frame(self, bg=BG)
+        mods.pack(fill="x", padx=18)
+        self.var_mod = {}
+        for c, h in enumerate(("", "SLS (service)", "ULS (design)")):
+            tk.Label(mods, text=h, font=parent.f_detail, bg=BG, fg=FG_MUTED).grid(row=0, column=c)
+        for r, key in enumerate(("beams", "columns", "walls", "floors"), start=1):
+            tk.Label(mods, text=key.capitalize(), font=parent.f_field, bg=BG, fg=FG_DIM).grid(
+                row=r, column=0, sticky="w")
+            for c in (0, 1):
+                v = tk.StringVar(value=str(mapping.modifiers[key][c]))
+                self.var_mod[(key, c)] = v
+                tk.Entry(mods, textvariable=v, width=8, font=parent.f_field, bg=SURFACE2, fg=FG,
+                         relief="flat", insertbackground=FG).grid(row=r, column=c + 1, padx=8, pady=2)
+        tk.Checkbutton(self, text="Also scale the torsion constant J of frames "
+                                  "(leave off if your models keep J = 1)", variable=self.var_J,
+                       font=parent.f_detail, bg=BG, fg=FG_DIM, selectcolor=SURFACE2,
+                       activebackground=BG, activeforeground=FG).pack(anchor="w", padx=18, pady=(6, 0))
+
+        buttons = tk.Frame(self, bg=BG)
+        buttons.pack(fill="x", padx=18, pady=12)
+        parent._flat_button(buttons, "Cancel", FG_MUTED, self._cancel, small=True).pack(side="right")
+        parent._flat_button(buttons, "Save and continue", BLUE, self._accept,
+                            small=True).pack(side="right", padx=(0, 8))
+        self.bind("<Escape>", lambda e: self._cancel())
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.update_idletasks()
+        self.grab_set()
+        self.wait_window(self)
+
+    def _accept(self):
+        rx = self._rx
+        m = rx.ReportMapping.from_dict(self._base.to_dict())
+        for k in rx.ROLE_KEYS:
+            setattr(m, k, [])
+        for n, var in self.var_role.items():
+            key = self._title_to_key.get(var.get())
+            if key:
+                getattr(m, key).append(n)
+        m.modal_case, m.dead_case, m.live_case = (self.var_modal.get(), self.var_dead.get(),
+                                                  self.var_live.get())
+        m.ground_story = "" if self.var_ground.get() == self.AUTO else self.var_ground.get()
+        m.typical_story = "" if self.var_typical.get() == self.AUTO else self.var_typical.get()
+        m.scale_frame_J = bool(self.var_J.get())
+        try:
+            for (key, c), v in self.var_mod.items():
+                val = float(v.get())
+                if not 0.0 < val <= 1.0:
+                    raise ValueError
+                m.modifiers[key][c] = val
+        except ValueError:
+            messagebox.showerror("Modifiers", "Modifier values must be numbers between 0 and 1.", parent=self)
+            return
+        for r in ("eq_x", "eq_y"):
+            if not getattr(m, r):
+                messagebox.showerror("Mapping", f"Choose at least one case for {rx.ROLE_TITLES[r]}.", parent=self)
+                return
+        if not (m.modal_case and m.dead_case and m.live_case):
+            messagebox.showerror("Mapping", "Choose the modal, dead load and live load cases.", parent=self)
+            return
+        self.result = m
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
 class Redirect(io.StringIO):
     """Send writes to a callback instead of the real stdout."""
 
@@ -737,14 +881,44 @@ class App(tk.Tk):
         self._refresh_etabs_label()
 
     def _stacked_pair(self, parent, col, cell_top, cell_bottom):
-        """Compact cards stacked in one grid column: 02, 03, pier relabel, 04."""
+        """Compact cards stacked in one grid column: 02, 03, pier relabel, design review report."""
         wrap = tk.Frame(parent, bg=BG)
         wrap.grid(row=0, column=col, padx=(8, 0), sticky="nsew")
         wrap.columnconfigure(0, weight=1)
         self._mini_card(wrap, 0, cell_top)
         self._mini_card(wrap, 1, cell_bottom)
         self._pier_mini_card(wrap, 2)
-        self._mini_card(wrap, 3, CELLS[3])
+        self._report_mini_card(wrap, 3)
+
+    def _report_mini_card(self, parent, row):
+        """Compact card: build the design review report from the analysed model."""
+        border = tk.Frame(parent, bg=BORDER, padx=1, pady=1)
+        border.grid(row=row, column=0, sticky="nsew", pady=(8, 0))
+        card = tk.Frame(border, bg=SURFACE)
+        card.pack(fill="both", expand=True)
+        tk.Frame(card, bg=BLUE, height=3).pack(fill="x")
+
+        body = tk.Frame(card, bg=SURFACE)
+        body.pack(fill="both", expand=True, padx=14, pady=10)
+        tk.Label(body, text="Design Review Report", font=self.f_title, fg=FG,
+                 bg=SURFACE, anchor="w").pack(fill="x")
+        tk.Label(body,
+                 text="Reads the model (SLS and ULS), then opens the report "
+                      "in the report app to check and edit",
+                 font=self.f_sub, fg=BLUE, bg=SURFACE, anchor="w",
+                 justify="left", wraplength=260).pack(fill="x", pady=(4, 8))
+        row_btns = tk.Frame(body, bg=SURFACE)
+        row_btns.pack(fill="x")
+        for i, (text, key, accent, cmd) in enumerate((
+                ("Cases...", "report_map", PURPLE, self._report_edit_mapping),
+                ("Generate", "report_full", BLUE,
+                 lambda: self._report_start("full")),
+                ("Quick read", "report_quick", GREEN,
+                 lambda: self._report_start("quick")))):
+            btn = self._flat_button(row_btns, text, accent, cmd, small=True)
+            btn.pack(side="left", expand=True, fill="x",
+                     padx=(0 if i == 0 else 6, 0))
+            self._buttons[key] = btn
 
     def _mini_card(self, parent, row, cell):
         """A compact variant of _card for the stacked column."""
@@ -1881,6 +2055,169 @@ class App(tk.Tk):
         dialog.grab_set()
         dialog.wait_window()
         return chosen["value"]
+
+    # ── Design review report ─────────────────────────────────────────────────
+
+    _REPORT_BUTTONS = ("report_map", "report_full", "report_quick")
+
+    def _report_buttons(self, enabled):
+        for key in self._REPORT_BUTTONS:
+            (self._enable if enabled else self._disable)(self._buttons[key])
+
+    def _report_banner(self, title):
+        self._log("")
+        self._log("-" * 60, "info")
+        self._log(f"  {title}", "info")
+        self._log("-" * 60, "info")
+
+    def _report_edit_mapping(self):
+        self._report_start("mapping")
+
+    def _report_start(self, mode):
+        """mode: 'mapping' (just edit the case mapping), 'full' or 'quick'."""
+        model = self._sap_model()
+        if model is None:
+            return
+        self._report_buttons(False)
+        self._report_banner("Design Review Report -- reading the case list")
+
+        def job():
+            import report_extractor as rx
+            import report_modifiers
+            path = report_modifiers.model_file(model)
+            saved, was_saved = rx.load_mapping(path) if path else (None, False)
+            mapping = saved or rx.guess_mapping(model)
+            return {"path": path, "mapping": mapping, "from_file": was_saved,
+                    "cases": rx.describe_cases(model),
+                    "stories": list(model.Story.GetNameList(0, [])[1])}
+
+        def done(ok, payload, elapsed):
+            self._post(self._report_mapping_step, mode, ok, payload)
+
+        self._worker.submit(job, done)
+
+    def _report_mapping_step(self, mode, ok, info):
+        if not ok:
+            self._report_failed("Could not read the case list", info)
+            return
+        import report_extractor as rx
+        if mode == "mapping" or not info["from_file"]:
+            self._log("  Confirm which load cases are EQ, SPEC, gust wind and static wind."
+                      if not info["from_file"] else "  Editing the saved case mapping.", "info")
+            dlg = ReportMappingDialog(self, info["cases"], info["stories"], info["mapping"])
+            if dlg.result is None:
+                self._log("  Cancelled.", "warn")
+                self._report_buttons(True)
+                return
+            info["mapping"] = dlg.result
+            if info["path"]:
+                rx.save_mapping(info["path"], dlg.result)
+                self._log(f"  Mapping saved: {rx.mapping_path(info['path'])}", "ok")
+        if mode == "mapping":
+            self._report_buttons(True)
+            return
+        mapping = info["mapping"]
+        model = NS.get("SapModel")
+        self._report_banner(f"Design Review Report -- checking the model ({mode})")
+
+        def job():
+            import report_pipeline
+            return report_pipeline.prepare(
+                model, mapping, mode, log=lambda t: self._post(self._log, "  " + t))
+
+        def done(ok, payload, elapsed):
+            self._post(self._report_plan_step, mode, mapping, ok, payload)
+
+        self._worker.submit(job, done)
+
+    def _report_plan_step(self, mode, mapping, ok, prepared):
+        if not ok:
+            self._report_failed("The check failed", prepared)
+            return
+        for w in prepared.warnings:
+            self._log(f"  warning: {w}", "warn")
+        if prepared.errors:
+            for e in prepared.errors:
+                self._log(f"  problem: {e}", "err")
+            messagebox.showerror("Cannot generate the report",
+                                 "\n\n".join(prepared.errors), parent=self)
+            self._report_buttons(True)
+            return
+        text = "\n\n".join(prepared.plan)
+        self._log("  Plan:", "info")
+        for line in prepared.plan:
+            self._log("   - " + line)
+        if mode == "full" and not messagebox.askokcancel(
+                "Generate the design review report",
+                text + "\n\nProceed?", parent=self):
+            self._log("  Cancelled before anything was changed.", "warn")
+            self._report_buttons(True)
+            return
+        self._report_banner("Design Review Report -- generating")
+        model = NS.get("SapModel")
+
+        def job():
+            import report_pipeline
+            log = lambda t: self._post(self._log, "  " + t)
+            report = report_pipeline.execute(model, prepared, mapping, log=log)
+            path = report_pipeline.save_report(
+                report, report_pipeline.output_path(prepared.model_path))
+            return path, report
+
+        def done(ok, payload, elapsed):
+            self._post(self._report_done, ok, payload, elapsed)
+
+        self._worker.submit(job, done)
+
+    def _report_failed(self, what, exc):
+        self._write("".join(traceback.format_exception(
+            type(exc), exc, exc.__traceback__)), "err")
+        self._log(f"  {what}: {exc}", "err")
+        messagebox.showerror(what, str(exc), parent=self)
+        self._report_buttons(True)
+
+    def _report_done(self, ok, payload, elapsed):
+        self._report_buttons(True)
+        if not ok:
+            self._report_failed("Report generation failed", payload)
+            return
+        path, data = payload
+        ex = data["extraction"]
+        b = data["building"]
+        self._log(f"  Report data saved: {path}  ({elapsed / 60:.1f} min)", "ok")
+        self._log(f"  {data['metadata']['projectName']}: "
+                  f"{b['heightAboveGround_m']:.1f} m above ground, typical story "
+                  f"{ex['typicalStory']}, torsion points on {ex['torsionStory']}", "ok")
+        for c in ex["checks"]:
+            tag = {"pass": "ok", "warn": "warn", "fail": "err"}.get(c["status"])
+            self._log(f"  [{c['status']}] {c['id']}: {c['detail']}", tag)
+        for note in ex["notes"]:
+            self._log(f"  note: {note}")
+        self._log("  suggested statuses (engineer decides): " +
+                  ", ".join(f"{k} = {v}" for k, v in ex["suggestions"].items()), "warn")
+        self._log("  still to type in the report: " + "; ".join(ex["needsInput"]), "warn")
+        self._open_report(path)
+
+    def _open_report(self, path):
+        import report_server
+        dist = report_server.find_app_dist()
+        if dist is None:
+            self._log("  The report app is not built (etabs-report/dist missing). "
+                      "Run 'npm run build' in the etabs-report folder, then use "
+                      "Import JSON in the app with the file above.", "warn")
+            messagebox.showwarning(
+                "Report app not found",
+                "The report data was saved, but the report app is not built.\n\n"
+                "Run 'npm run build' in the etabs-report folder, or set the "
+                "ETABS_REPORT_APP environment variable to its dist folder.\n\n" + path,
+                parent=self)
+            return
+        if getattr(self, "_report_server", None) is None:
+            self._report_server = report_server.ReportServer(dist)
+        url = self._report_server.open_report(path)
+        self._log(f"  Opened the report in your browser: {url}", "ok")
+        self._log("  Check the values there, fix anything, then Export Excel. "
+                  "Keep this window open while you work in the report.")
 
     def _export_done(self, button_key, what, ok, payload):
         self._enable(self._buttons[button_key])
